@@ -1,4 +1,5 @@
 import hashlib
+import json
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -98,6 +99,12 @@ def _context():
             lifespan_context={"client": None, "node_catalog_store": None}
         )
     )
+
+
+def _tool_result_payload(result) -> dict:
+    if result.structured_content is not None:
+        return result.structured_content
+    return json.loads(result.content[0].text)
 
 
 def _catalog() -> dict:
@@ -445,9 +452,10 @@ class _FakeCatalogClient:
     def __init__(self, *, catalog_hash: str | None = None):
         self.data = _catalog()
         self.catalog_hash = catalog_hash or catalog_contract_hash(self.data)
+        self.force_refreshes = []
 
     async def catalog_snapshot(self, *, force_refresh: bool = False):
-        assert force_refresh is True
+        self.force_refreshes.append(force_refresh)
         return NodeCatalogSnapshot(
             data=self.data,
             source=self.source,
@@ -1450,6 +1458,216 @@ def test_backend_idempotency_returns_none_when_application_was_not_recorded():
     ) is None
 
 
+def test_native_compiler_result_uses_a_small_opaque_apply_handle(monkeypatch):
+    monkeypatch.setenv("FL_MCP_NATIVE_TURN_CONTROLS", "1")
+    context = _context()
+    state = mcp_server._native_turn_state(context)
+    state["compile_attempts"] = 1
+    request = _request()
+    result = mcp_server._native_compiler_result(context, {
+        "valid": True,
+        "compiler_schema": "fl-mcp.workflow-refinement-compiler.v1",
+        "needs_choice": False,
+        "patch_hash": request.patch_hash,
+        "catalog": {"hash": CATALOG_HASH},
+        "plan": {"large": "x" * 100_000},
+        "apply_request": request.model_dump(mode="json"),
+        "issues": [],
+        "error_count": 0,
+        "warning_count": 0,
+    })
+
+    payload = _tool_result_payload(result)
+    assert len(result.content[0].text) <= mcp_server.NATIVE_COMPILER_RESULT_MAX_CHARS
+    assert "apply_request" not in payload
+    assert payload["valid"] is True
+    assert len(payload["apply_handle"]) == 32
+    assert state["apply_handles"][payload["apply_handle"]] == request
+
+
+@pytest.mark.asyncio
+async def test_native_apply_handle_resolves_exactly_once(monkeypatch):
+    request = _request()
+
+    async def execute_tool(ctx, name, payload, timeout_ms=30000):
+        assert name == "workflow_get_current_json"
+        return {
+            **_active(request),
+            "workflow_identity_schema": mcp_server.WORKFLOW_IDENTITY_SCHEMA,
+            "graph_hash_schema": mcp_server.GRAPH_PRECONDITION_HASH_SCHEMA,
+        }
+
+    monkeypatch.setenv("FL_MCP_NATIVE_TURN_CONTROLS", "1")
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_node_library_client",
+        lambda **kwargs: _FakeCatalogClient(),
+    )
+    monkeypatch.setattr(mcp_server.settings, "enable_workflow_writes", True)
+    context = _context()
+    handle = "f" * 32
+    mcp_server._native_turn_state(context)["apply_handles"][handle] = request
+    handle_request = mcp_server.WorkflowGraphPatchApplyHandle(handle=handle)
+
+    first = await mcp_server.apply_workflow_graph_patch.fn(handle_request, context)
+    second = await mcp_server.apply_workflow_graph_patch.fn(handle_request, context)
+
+    first_payload = _tool_result_payload(first)
+    assert first_payload["success"] is True
+    assert first_payload["already_applied"] is True
+    assert _tool_result_payload(second)["budget_exhausted"] is True
+
+
+@pytest.mark.asyncio
+async def test_native_compiler_allows_one_validation_repair_then_stops(
+    monkeypatch,
+):
+    async def execute_tool(ctx, name, payload, timeout_ms=30000):
+        assert name == "workflow_get_current_json"
+        return _active_workflow_result()
+
+    invalid = {
+        "valid": False,
+        "compiler_schema": "fl-mcp.workflow-refinement-compiler.v1",
+        "needs_choice": False,
+        "patch_hash": None,
+        "apply_request": None,
+        "issues": [{
+            "severity": "error",
+            "code": "unknown_value_field",
+            "path": "create_nodes.output.values.filename_prefix",
+            "message": "The field is not editable. " + "x" * 20_000,
+        }],
+        "error_count": 1,
+        "warning_count": 0,
+    }
+    monkeypatch.setenv("FL_MCP_NATIVE_TURN_CONTROLS", "1")
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_node_library_client",
+        lambda **kwargs: _FakeCatalogClient(),
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "compile_semantic_refinement",
+        lambda *args, **kwargs: invalid,
+    )
+    context = _context()
+
+    first = _tool_result_payload(await mcp_server.compile_workflow_refinement_spec.fn(
+        _semantic_request(),
+        context,
+    ))
+    second = _tool_result_payload(await mcp_server.compile_workflow_refinement_spec.fn(
+        _semantic_request(),
+        context,
+    ))
+    third = _tool_result_payload(await mcp_server.compile_workflow_refinement_spec.fn(
+        _semantic_request(),
+        context,
+    ))
+
+    assert first["compiler_attempt"] == 1
+    assert first["compiler_attempts_remaining"] == 1
+    assert "compile once more" in first["message"]
+    assert second["compiler_attempt"] == 2
+    assert second["compiler_attempts_remaining"] == 0
+    assert "remaining issues" in second["message"]
+    assert third["budget_exhausted"] is True
+    assert len(json.dumps(first)) <= mcp_server.NATIVE_COMPILER_RESULT_MAX_CHARS
+
+
+@pytest.mark.asyncio
+async def test_native_read_results_are_content_only_bounded_and_deduplicated(
+    monkeypatch,
+):
+    calls = 0
+
+    async def execute_tool(ctx, name, payload, timeout_ms=30000):
+        nonlocal calls
+        calls += 1
+        return {
+            "results": [
+                {"id": index, "type": "KSampler", "title": "x" * 1_000}
+                for index in range(100)
+            ],
+            "count": 100,
+            "total": 100,
+            "offset": 0,
+            "limit": 100,
+            "has_more": False,
+            "next_offset": None,
+            "format": "full",
+        }
+
+    monkeypatch.setenv("FL_MCP_NATIVE_TURN_CONTROLS", "1")
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+    context = _context()
+    parameters = {"result_format": "full", "limit": 100}
+
+    first_result = await mcp_server._native_read_tool(
+        context,
+        "query_workflow",
+        parameters,
+    )
+    second_result = await mcp_server._native_read_tool(
+        context,
+        "query_workflow",
+        parameters,
+    )
+    first = _tool_result_payload(first_result)
+    second = _tool_result_payload(second_result)
+
+    assert calls == 1
+    assert first["compacted"] is True
+    assert len(first_result.content[0].text) <= mcp_server.NATIVE_MODEL_RESULT_MAX_CHARS
+    assert second["reused"] is True
+
+
+@pytest.mark.asyncio
+async def test_native_failed_read_is_not_cached_as_success(monkeypatch):
+    calls = 0
+
+    async def execute_tool(ctx, name, payload, timeout_ms=30000):
+        nonlocal calls
+        calls += 1
+        return {"success": False, "error": "temporary bridge failure"}
+
+    monkeypatch.setenv("FL_MCP_NATIVE_TURN_CONTROLS", "1")
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+    context = _context()
+
+    await mcp_server._native_read_tool(context, "workflow_overview", {})
+    second = _tool_result_payload(await mcp_server._native_read_tool(
+        context,
+        "workflow_overview",
+        {},
+    ))
+
+    assert calls == 1
+    assert not mcp_server._native_turn_state(context)["completed_reads"]
+    assert second["budget_exhausted"] is True
+
+
+def test_native_oversized_apply_result_keeps_outcome(monkeypatch):
+    monkeypatch.setenv("FL_MCP_NATIVE_TURN_CONTROLS", "1")
+    result = mcp_server._native_read_result(
+        "apply_workflow_graph_patch",
+        {
+            "success": True,
+            "patch_hash": "a" * 64,
+            "validation": {"detail": "x" * 100_000},
+        },
+    )
+
+    payload = _tool_result_payload(result)
+    assert payload["success"] is True
+    assert payload["patch_hash"] == "a" * 64
+    assert len(result.content[0].text) <= mcp_server.NATIVE_MODEL_RESULT_MAX_CHARS
+
+
 @pytest.mark.asyncio
 async def test_compile_tool_passes_verified_lessons_to_semantic_planning(monkeypatch):
     async def execute_tool(ctx, name, payload, timeout_ms=30000):
@@ -1956,6 +2174,7 @@ async def test_apply_rechecks_attachment_after_awaited_catalog_refresh(
     )
 
     assert catalog_client.snapshot_count == 2
+    assert catalog_client.force_refreshes == [False, True]
     assert result["success"] is False
     assert result["applied"] is False
     assert result["error"]["code"] == "attachment_missing_or_changed"

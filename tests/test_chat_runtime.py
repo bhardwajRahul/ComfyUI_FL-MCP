@@ -10,11 +10,16 @@ from chat_runtime import (
     BRANCH_DISCOVERY_TOOLS,
     BRANCH_MUTATION_TOOLS,
     BRANCH_NAVIGATION_TOOLS,
+    CANVAS_CHAT_TOOLS,
     CONTEXT_MAX_CHARS,
+    LAYOUT_TOOLS,
+    MODEL_COMPILER_RESULT_MAX_CHARS,
+    MODEL_TOOL_RESULT_MAX_CHARS,
     REFINEMENT_COMPILER_TOOLS,
     ActiveRun,
     ChatRuntime,
     PendingApproval,
+    apply_turn_context_to_messages,
     approval_fingerprint,
     bridge_settings,
     claude_tool_name,
@@ -25,15 +30,24 @@ from chat_runtime import (
     explicit_web_research_requested,
     install_codex_approval_handler,
     message_content_for_model,
+    model_tool_definitions_for_provider,
     native_prompt_with_compaction,
     normalize_approval_decision,
     normalize_assistant_timeline,
     normalize_chat_attachments,
+    prepare_embedded_tool_result,
+    record_turn_tool_result,
     registry_discovery_instructions,
     ren_instructions,
+    resolve_embedded_tool_arguments,
+    remaining_tools_for_run,
+    resolve_turn_context,
+    resumable_native_thread_id,
+    routing_message_for_turn,
     should_request_approval,
     tool_result_content,
     tools_for_message,
+    turn_tool_block,
     wait_for_claude_mcp,
     wait_for_codex_mcp_status,
     web_image_requested,
@@ -43,6 +57,8 @@ from chat_runtime import (
     workflow_context_environment,
     workflow_context_instructions,
     workflow_graph_change_requested,
+    workflow_layout_arrangement_requested,
+    workflow_layout_inspection_requested,
     workflow_refinement_requested,
 )
 from chat_store import ChatStore
@@ -259,6 +275,11 @@ async def test_run_events_track_text_tools_retries_and_replay(tmp_path):
     assert state.tool_steps[1]["status"] == "done"
     assert state.tool_steps[1]["result"] == '{"nodes": 3}'
     assert state.tool_steps[1]["contentOffset"] == 0
+    assert state.tool_steps[1]["startedAt"]
+    assert state.tool_steps[1]["completedAt"]
+    assert state.tool_steps[1]["durationMs"] >= 0
+    assert state.tool_steps[1]["argumentChars"] == 0
+    assert state.tool_steps[1]["resultChars"] == len('{"nodes": 3}')
 
     state.done = True
     replay = [_payload(raw) async for raw in runtime.subscribe(state.run_id)]
@@ -462,30 +483,17 @@ async def test_global_bypass_does_not_release_mandatory_mask_review(tmp_path):
     assert "mask-review-1" in runtime.approvals
 
 
-def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
+def test_tool_filter_always_exposes_canvas_controls_and_adds_narrow_groups():
+    assert "query_workflow" in CANVAS_CHAT_TOOLS
+    assert tools_for_message("Hello Ren") == CANVAS_CHAT_TOOLS
+    assert tools_for_message("What does CFG mean?") == CANVAS_CHAT_TOOLS
     basic = tools_for_message("Inspect the open graph")
-    assert "workflow_overview" in basic
-    assert "view_output_image" in basic
-    assert "view_chat_image" in basic
-    assert "place_chat_image_in_node" in basic
-    assert "view_node_mask" in basic
-    assert "edit_node_mask" in basic
-    assert "confirm_mask_review" in basic
-    assert "get_execution_history" in basic
-    assert "node_library_search" in basic
-    assert "node_library_get_details" in basic
-    assert "node_library_status" in basic
-    assert "node_knowledge_search" in basic
-    assert "compile_workflow_spec" in basic
-    assert "resolve_workflow_spec" in basic
-    assert "plan_workflow" in basic
-    assert "apply_workflow_plan" in basic
-    assert "registry_search_packages" in basic
-    assert "registry_get_package" in basic
-    assert "node_library_find_compatible" not in basic
-    assert "web_search" not in basic
-    assert "web_fetch_page" not in basic
-    assert "manager_queue_action" not in basic
+    assert basic == CANVAS_CHAT_TOOLS
+
+    current = tools_for_message("How many nodes are in my current workflow?")
+    assert len(current) == len(CANVAS_CHAT_TOOLS)
+    assert "workflow_overview" in current
+    assert "apply_workflow_graph_patch" not in current
 
     free_web = tools_for_message("Research current ComfyUI nodes", "free")
     assert "web_search" in free_web
@@ -504,7 +512,527 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     assert "get_execution_details" in review
 
 
-def test_complete_new_workflow_uses_only_compiler_application_route():
+def test_natural_canvas_requests_and_retries_keep_canvas_controls_available():
+    for request in (
+        "take a look at my workflow",
+        "take a look at our workflow",
+        "look at the current canvas",
+        "review the loaded workflow",
+        "examine my graph",
+        "make this more condensed",
+        "no njust make your best judgement",
+    ):
+        assert tools_for_message(request) == CANVAS_CHAT_TOOLS
+
+    messages = [
+        {
+            "id": "user-1",
+            "role": "user",
+            "content": "take a look at my workflow",
+            "metadata": {},
+        },
+        {
+            "id": "assistant-1",
+            "role": "assistant",
+            "content": "Ren MCP canvas tools are not available in this turn.",
+        },
+        {"id": "user-2", "role": "user", "content": "try again", "metadata": {}},
+    ]
+
+    turn = resolve_turn_context(messages, messages[-1])
+
+    assert turn.allowed_tools == CANVAS_CHAT_TOOLS
+    assert turn.inherited_source_message_id == "user-1"
+    assert "take a look at my workflow" in turn.provider_user_message
+
+
+def test_layout_cleanup_and_continuations_keep_the_required_tools():
+    request = "Can you clean up and compact the workflow?"
+    assert workflow_layout_arrangement_requested(request)
+    assert tools_for_message(request) == CANVAS_CHAT_TOOLS | LAYOUT_TOOLS
+    assert not workflow_layout_arrangement_requested(
+        "Add a node and arrange the workflow"
+    )
+    inspection = "Inspect the current workflow layout and describe its bounds."
+    assert workflow_layout_inspection_requested(inspection)
+    assert tools_for_message(inspection) == CANVAS_CHAT_TOOLS
+
+    messages = [
+        {"id": "user-1", "role": "user", "content": request, "metadata": {}},
+        {"id": "assistant-1", "role": "assistant", "content": "I can do that."},
+        {"id": "user-2", "role": "user", "content": "proceed", "metadata": {}},
+        {"id": "assistant-2", "role": "assistant", "content": "Starting."},
+        {"id": "user-3", "role": "user", "content": "continue", "metadata": {}},
+    ]
+    routed = routing_message_for_turn(messages, messages[-1])
+
+    assert request in routed
+    assert "Current user reply: continue" in routed
+    assert "confirmed" not in routed
+    assert tools_for_message(routed) == CANVAS_CHAT_TOOLS | LAYOUT_TOOLS
+
+
+def test_layout_retry_chain_recovers_the_original_request_and_provider_context():
+    request = "Can you clean up and compact the workflow?"
+    messages = [
+        {"id": "user-1", "role": "user", "content": request, "metadata": {}},
+        {
+            "id": "assistant-1",
+            "role": "assistant",
+            "content": "<function_calls><invoke name=\"mcp__flmcp__get_workflow\">",
+        },
+        {"id": "user-2", "role": "user", "content": "proceed", "metadata": {}},
+        {"id": "assistant-2", "role": "assistant", "content": "Tools are unavailable."},
+        {"id": "user-3", "role": "user", "content": "continue", "metadata": {}},
+        {"id": "assistant-3", "role": "assistant", "content": "Please enable tools."},
+        {"id": "user-4", "role": "user", "content": "try now", "metadata": {}},
+        {"id": "assistant-4", "role": "assistant", "content": "Still unavailable."},
+        {"id": "user-5", "role": "user", "content": "retry", "metadata": {}},
+    ]
+
+    turn = resolve_turn_context(messages, messages[-1])
+
+    assert turn.allowed_tools == CANVAS_CHAT_TOOLS | LAYOUT_TOOLS
+    assert turn.inherited_source_message_id == "user-1"
+    assert turn.inheritance_reason == "retry"
+    assert request in turn.routing_message
+    assert "Current user reply:\nretry" in turn.provider_user_message
+    assert "not separate approval" in turn.provider_user_message
+    prepared = apply_turn_context_to_messages(messages, "user-5", turn)
+    assert prepared[-1]["content"] == turn.provider_user_message
+    assert messages[-1]["content"] == "retry"
+
+
+def test_contextual_reply_preserves_constraints_but_stops_at_an_independent_turn():
+    request = "Clean up and compact the current workflow."
+    constrained = [
+        {"id": "user-1", "role": "user", "content": request, "metadata": {}},
+        {"id": "assistant-1", "role": "assistant", "content": "Horizontal or vertical?"},
+        {
+            "id": "user-2",
+            "role": "user",
+            "content": "Yes, use vertical layout",
+            "metadata": {},
+        },
+    ]
+    turn = resolve_turn_context(constrained, constrained[-1])
+    assert turn.allowed_tools == CANVAS_CHAT_TOOLS | LAYOUT_TOOLS
+    assert request in turn.provider_user_message
+    assert "Yes, use vertical layout" in turn.provider_user_message
+
+    constrained[-1] = {
+        "id": "user-2",
+        "role": "user",
+        "content": "Continue with vertical layout",
+        "metadata": {},
+    }
+    turn = resolve_turn_context(constrained, constrained[-1])
+    assert turn.allowed_tools == CANVAS_CHAT_TOOLS | LAYOUT_TOOLS
+    assert request in turn.provider_user_message
+
+    independent = [
+        *constrained[:-1],
+        {"id": "user-2", "role": "user", "content": "Thanks for explaining.", "metadata": {}},
+        {"id": "assistant-2", "role": "assistant", "content": "You're welcome."},
+        {"id": "user-3", "role": "user", "content": "continue", "metadata": {}},
+    ]
+    turn = resolve_turn_context(independent, independent[-1])
+    assert turn.allowed_tools == CANVAS_CHAT_TOOLS
+    assert turn.inherited_source_message_id is None
+
+
+def test_native_thread_bootstrap_sanitizes_fake_tool_markup_and_switches_safely():
+    messages = [
+        {
+            "id": "user-1",
+            "role": "user",
+            "content": "Clean up the workflow layout.",
+            "provider": "lmstudio",
+            "model": "local-model",
+            "metadata": {},
+        },
+        {
+            "id": "assistant-1",
+            "role": "assistant",
+            "content": "<function_calls><invoke name=\"get_layout\">",
+            "provider": "lmstudio",
+            "model": "local-model",
+            "metadata": {},
+        },
+        {
+            "id": "user-2",
+            "role": "user",
+            "content": "continue",
+            "provider": "codex_subscription",
+            "model": "gpt-5.6-sol",
+            "metadata": {},
+        },
+    ]
+    turn = resolve_turn_context(messages, messages[-1])
+    prompt, compacted = native_prompt_with_compaction(
+        messages,
+        turn.provider_user_message,
+        bootstrap=True,
+    )
+
+    assert compacted is False
+    assert "Clean up the workflow layout" in prompt
+    assert "simulated tool-call markup omitted" in prompt
+    assert "<function_calls>" not in prompt
+    assert resumable_native_thread_id(
+        messages,
+        messages[-1],
+        provider="codex_subscription",
+        model="gpt-5.6-sol",
+        metadata_key="codexThreadId",
+    ) is None
+
+    messages.extend([
+        {
+            "id": "assistant-2",
+            "role": "assistant",
+            "content": "Inspected.",
+            "provider": "codex_subscription",
+            "model": "gpt-5.6-sol",
+            "metadata": {"codexThreadId": "codex-thread"},
+        },
+        {
+            "id": "user-3",
+            "role": "user",
+            "content": "continue",
+            "provider": "codex_subscription",
+            "model": "gpt-5.6-sol",
+            "metadata": {},
+        },
+    ])
+    assert resumable_native_thread_id(
+        messages,
+        messages[-1],
+        provider="codex_subscription",
+        model="gpt-5.6-sol",
+        metadata_key="codexThreadId",
+    ) == "codex-thread"
+
+    messages.extend([
+        {
+            "id": "assistant-3",
+            "role": "assistant",
+            "content": "Switched provider.",
+            "provider": "claude_subscription",
+            "model": "sonnet",
+            "metadata": {"claudeSessionId": "claude-session"},
+        },
+        {
+            "id": "user-4",
+            "role": "user",
+            "content": "retry",
+            "provider": "codex_subscription",
+            "model": "gpt-5.6-sol",
+            "metadata": {},
+        },
+    ])
+    assert resumable_native_thread_id(
+        messages,
+        messages[-1],
+        provider="codex_subscription",
+        model="gpt-5.6-sol",
+        metadata_key="codexThreadId",
+    ) is None
+
+
+def test_lmstudio_tool_schemas_drop_only_unsupported_large_bounds():
+    from pydantic_ai.tools import ToolDefinition
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "minLength": 1, "maxLength": 2048},
+            "items": {
+                "type": "array",
+                "maxItems": 2000,
+                "items": {"type": "string", "maxLength": 1000},
+            },
+        },
+    }
+    definition = ToolDefinition(name="web_fetch_page", parameters_json_schema=schema)
+
+    prepared = model_tool_definitions_for_provider(
+        "lmstudio",
+        {"web_fetch_page"},
+        [definition, ToolDefinition(name="web_search")],
+    )
+
+    assert [item.name for item in prepared] == ["web_fetch_page"]
+    prepared_schema = prepared[0].parameters_json_schema
+    assert "maxLength" not in prepared_schema["properties"]["url"]
+    assert "maxItems" not in prepared_schema["properties"]["items"]
+    assert prepared_schema["properties"]["url"]["minLength"] == 1
+    assert prepared_schema["properties"]["items"]["items"]["maxLength"] == 1000
+    assert definition.parameters_json_schema == schema
+
+
+def test_workflow_query_schema_exposes_bounded_incremental_fields():
+    from models import WorkflowQuery
+
+    schema = WorkflowQuery.model_json_schema()["properties"]
+    assert schema["limit"]["anyOf"][0]["maximum"] == 500
+    assert schema["offset"]["minimum"] == 0
+    assert schema["include_connections"]["default"] is False
+    assert schema["include_position"]["default"] is False
+
+
+def test_non_lmstudio_tool_schemas_are_preserved():
+    from pydantic_ai.tools import ToolDefinition
+
+    definition = ToolDefinition(
+        name="web_fetch_page",
+        parameters_json_schema={"type": "string", "maxLength": 2048},
+    )
+
+    prepared = model_tool_definitions_for_provider(
+        "ollama",
+        {"web_fetch_page"},
+        [definition],
+    )
+
+    assert prepared == [definition]
+    assert prepared[0] is definition
+
+
+def test_embedded_graph_apply_uses_an_opaque_compiler_handle():
+    from pydantic_ai.tools import ToolDefinition
+
+    definition = ToolDefinition(
+        name="apply_workflow_graph_patch",
+        description="large apply tool",
+        parameters_json_schema={
+            "type": "object",
+            "properties": {"request": {"type": "object", "properties": {
+                "plan": {"type": "object", "description": "x" * 20_000},
+            }}},
+        },
+    )
+    prepared = model_tool_definitions_for_provider(
+        "lmstudio",
+        {
+            "compile_workflow_refinement_spec",
+            "apply_workflow_graph_patch",
+        },
+        [definition],
+    )
+    schema = prepared[0].parameters_json_schema
+    assert schema["required"] == ["handle"]
+    assert len(json.dumps(schema)) < 500
+
+    state = ActiveRun("run-1", "conversation-1", "session-1")
+    result = prepare_embedded_tool_result(
+        state,
+        "compile_workflow_refinement_spec",
+        {"valid": True, "apply_request": {"application_id": "apply-1"}},
+    )
+    handle = result["apply_handle"]
+    assert "apply_request" not in result
+    assert resolve_embedded_tool_arguments(
+        state,
+        "apply_workflow_graph_patch",
+        {"handle": handle},
+    ) == {"request": {"application_id": "apply-1"}}
+    with pytest.raises(ValueError, match="invalid or expired"):
+        resolve_embedded_tool_arguments(
+            state,
+            "apply_workflow_graph_patch",
+            {"handle": "0" * 32},
+        )
+
+
+def test_embedded_compiler_result_is_compact_for_large_plans():
+    state = ActiveRun("run-1", "conversation-1", "session-1")
+    apply_request = {
+        "application_id": "apply-1",
+        "plan": {
+            "create_nodes": [{"alias": f"node-{index}", "detail": "x" * 2_000} for index in range(100)],
+            "add_edges": [{"source": index, "target": index + 1} for index in range(99)],
+        },
+    }
+
+    prepared = prepare_embedded_tool_result(state, "compile_workflow_refinement_spec", {
+        "valid": True,
+        "schema": "graph-patch",
+        "patch_hash": "hash",
+        "plan": apply_request["plan"],
+        "apply_request": apply_request,
+        "expected_final": {"nodes": list(range(100)), "edges": list(range(99))},
+        "issues": [],
+    })
+
+    assert len(json.dumps(prepared)) <= MODEL_COMPILER_RESULT_MAX_CHARS
+    assert "plan" not in prepared
+    assert prepared["operation_counts"]["create_nodes"] == 100
+    assert prepared["expected_final"] == {"node_count": 100, "edge_count": 99}
+    assert resolve_embedded_tool_arguments(
+        state,
+        "apply_workflow_graph_patch",
+        {"handle": prepared["apply_handle"]},
+    ) == {"request": apply_request}
+
+
+def test_large_workflow_snapshot_is_compacted_for_the_live_model():
+    state = ActiveRun("run-1", "conversation-1", "session-1")
+    result = {
+        "api_format": False,
+        "workflow_identity": "workflow-1",
+        "graph_hash": "graph-1",
+        "workflow": {
+            "nodes": [
+                {"id": index, "type": "KSampler", "title": "x" * 2_000}
+                for index in range(200)
+            ],
+            "links": [[index, index, 0, index + 1, 0, "IMAGE"] for index in range(199)],
+        },
+    }
+
+    prepared = prepare_embedded_tool_result(state, "workflow_get_current_json", result)
+
+    assert len(json.dumps(prepared)) <= MODEL_TOOL_RESULT_MAX_CHARS
+    assert prepared["compacted"] is True
+    assert prepared["node_count"] == 200
+    assert prepared["link_count"] == 199
+    assert "workflow" not in prepared
+
+
+def test_turn_budget_reuses_reads_and_allows_one_compile_apply_cycle():
+    state = ActiveRun("run-1", "conversation-1", "session-1")
+    query = {"result_format": "summary", "limit": 20}
+
+    assert turn_tool_block(state, "query_workflow", query) is None
+    fingerprint = approval_fingerprint("query_workflow", query)
+    record_turn_tool_result(state, "query_workflow", fingerprint, {"results": []})
+    duplicate = turn_tool_block(state, "query_workflow", query)
+    assert duplicate is not None
+    assert duplicate[1]["reused"] is True
+    assert state.tool_call_counts["query_workflow"] == 1
+
+    failed = ActiveRun("failed-read", "conversation-1", "session-1")
+    failed_args = {"api_format": False}
+    assert turn_tool_block(failed, "workflow_get_current_json", failed_args) is None
+    failed_fingerprint = approval_fingerprint(
+        "workflow_get_current_json",
+        failed_args,
+    )
+    record_turn_tool_result(
+        failed,
+        "workflow_get_current_json",
+        failed_fingerprint,
+        {"success": False, "error": "temporary bridge failure"},
+    )
+    assert failed_fingerprint not in failed.completed_read_calls
+
+    initial = remaining_tools_for_run(
+        state,
+        {"compile_workflow_refinement_spec", "apply_workflow_graph_patch"},
+    )
+    assert initial == {"compile_workflow_refinement_spec"}
+    assert turn_tool_block(state, "compile_workflow_refinement_spec", {"request": {}}) is None
+    record_turn_tool_result(
+        state,
+        "compile_workflow_refinement_spec",
+        approval_fingerprint("compile_workflow_refinement_spec", {"request": {}}),
+        {"valid": True, "apply_request": {"application_id": "apply-1"}},
+    )
+    ready = remaining_tools_for_run(
+        state,
+        {"compile_workflow_refinement_spec", "apply_workflow_graph_patch"},
+    )
+    assert ready == {"apply_workflow_graph_patch"}
+    assert turn_tool_block(state, "apply_workflow_graph_patch", {"handle": "a" * 32}) is None
+    record_turn_tool_result(
+        state,
+        "apply_workflow_graph_patch",
+        approval_fingerprint("apply_workflow_graph_patch", {"handle": "a" * 32}),
+        {"success": True},
+    )
+    assert remaining_tools_for_run(
+        state,
+        {"compile_workflow_refinement_spec", "apply_workflow_graph_patch"},
+    ) == set()
+
+    repair = ActiveRun("run-2", "conversation-1", "session-1")
+    compile_args = {"request": {"application_id": "repair-1"}}
+    assert turn_tool_block(
+        repair,
+        "compile_workflow_refinement_spec",
+        compile_args,
+    ) is None
+    record_turn_tool_result(
+        repair,
+        "compile_workflow_refinement_spec",
+        approval_fingerprint("compile_workflow_refinement_spec", compile_args),
+        {"valid": False, "issues": [{"code": "unknown_value_field"}]},
+    )
+    assert remaining_tools_for_run(
+        repair,
+        {"compile_workflow_refinement_spec", "apply_workflow_graph_patch"},
+    ) == {"compile_workflow_refinement_spec"}
+    assert turn_tool_block(
+        repair,
+        "compile_workflow_refinement_spec",
+        {"request": {"application_id": "repair-2"}},
+    ) is None
+    assert "compile_workflow_refinement_spec" not in remaining_tools_for_run(
+        repair,
+        {"compile_workflow_refinement_spec", "apply_workflow_graph_patch"},
+    )
+
+
+def test_embedded_branch_apply_preserves_the_compiler_request_contract():
+    from pydantic_ai.tools import ToolDefinition
+
+    schema = {
+        "type": "object",
+        "properties": {"request": {"type": "object"}},
+        "required": ["request"],
+    }
+    definition = ToolDefinition(
+        name="apply_workflow_graph_patch",
+        parameters_json_schema=schema,
+    )
+
+    prepared = model_tool_definitions_for_provider(
+        "ollama",
+        BRANCH_MUTATION_TOOLS,
+        [definition],
+    )
+
+    assert prepared[0] is definition
+    assert prepare_embedded_tool_result(
+        ActiveRun("run-1", "conversation-1", "session-1"),
+        "compile_workflow_branch_operation",
+        {"valid": True, "apply_request": {"application_id": "apply-1"}},
+    ) == {"valid": True, "apply_request": {"application_id": "apply-1"}}
+
+
+def test_dynamic_prompt_only_includes_selected_capabilities():
+    greeting = ren_instructions("free", set())
+    graph = ren_instructions("off", REFINEMENT_COMPILER_TOOLS)
+    layout = ren_instructions("off", LAYOUT_TOOLS)
+    layout_read = ren_instructions("off", {"get_layout"})
+    assert len(greeting) < 1_500
+    assert "compile_workflow_refinement_spec" not in greeting
+    assert "registry_search_packages" not in greeting
+    assert "compile_workflow_refinement_spec" in graph
+    assert "registry_search_packages" not in graph
+    assert "compile one final time in the same turn" in graph
+    assert "do not copy UI-only or unrelated values" in graph
+    assert "Never bypass GraphPatch or apply more than once" in graph
+    assert len(graph) < 4_000
+    assert "`get_layout`" in layout
+    assert "`modify_layout`" in layout
+    assert "compile_workflow_refinement_spec" not in layout
+    assert "read-only" in layout_read
+    assert "`modify_layout`" not in layout_read
+
+
+def test_complete_new_workflow_adds_only_the_compiler_application_route():
     request = (
         "I've attached a portrait first and a factory image second. Please set up "
         "Nano Banana 2, save it as ren-human-e2e, and don't run it yet.\n\n"
@@ -513,14 +1041,13 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     assert compiler_first_workflow_requested(request) is True
 
     selected = tools_for_message(request, "free")
-    assert selected == {
+    assert selected == CANVAS_CHAT_TOOLS | {
         "view_chat_image",
         "compile_workflow_refinement_spec",
         "apply_workflow_graph_patch",
     }
     assert "web_search" not in selected
     assert "web_fetch_page" not in selected
-    assert "workflow_overview" not in selected
     assert "node_library_status" not in selected
     assert "node_knowledge_search" not in selected
     assert "resolve_workflow_spec" not in selected
@@ -529,8 +1056,6 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     assert "compile_workflow_spec" not in selected
     assert "apply_workflow_plan" not in selected
     assert "place_chat_image_in_node" not in selected
-    assert "get_layout" not in selected
-    assert "modify_layout" not in selected
 
     for natural_build in (
         "On an empty canvas, create EmptyImage into SaveImage.",
@@ -544,13 +1069,13 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
         "Use SaveImage after the output.",
     ):
         assert workflow_graph_change_requested(natural_build) is True
-        assert tools_for_message(natural_build, "free") == {
+        assert tools_for_message(natural_build, "free") == CANVAS_CHAT_TOOLS | {
             "compile_workflow_refinement_spec",
             "apply_workflow_graph_patch",
         }
 
     no_run = tools_for_message("Build a workflow and don’t run it.")
-    assert no_run == REFINEMENT_COMPILER_TOOLS
+    assert no_run == CANVAS_CHAT_TOOLS | REFINEMENT_COMPILER_TOOLS
     assert "queue_workflow" not in no_run
 
     manager_request = "Install or update this custom node pack with Manager."
@@ -560,7 +1085,7 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     edit = "Change the seed on the selected KSampler node to 7."
     assert compiler_first_workflow_requested(edit) is False
     assert workflow_refinement_requested(edit) is True
-    assert tools_for_message(edit) == {
+    assert tools_for_message(edit) == CANVAS_CHAT_TOOLS | {
         "compile_workflow_refinement_spec",
         "apply_workflow_graph_patch",
     }
@@ -590,12 +1115,12 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     assert "web_fetch_page" not in selected_with_knowledge
 
 
-def test_existing_chain_edit_uses_only_atomic_refinement_route():
+def test_existing_chain_edit_adds_only_the_atomic_refinement_route():
     request = "Add an upscaler after the selected decode node in the existing workflow."
     assert workflow_refinement_requested(request) is True
 
     selected = tools_for_message(request, "free")
-    assert selected == {
+    assert selected == CANVAS_CHAT_TOOLS | {
         "compile_workflow_refinement_spec",
         "apply_workflow_graph_patch",
     }
@@ -606,8 +1131,6 @@ def test_existing_chain_edit_uses_only_atomic_refinement_route():
     assert "create_nodes" not in selected
     assert "remove_nodes" not in selected
     assert "connect_nodes_batch" not in selected
-    assert "workflow_overview" not in selected
-    assert "workflow_get_current_json" not in selected
     assert "node_library_search" not in selected
     assert "node_library_get_details" not in selected
     assert "web_search" not in selected
@@ -638,7 +1161,7 @@ def test_existing_chain_edit_uses_only_atomic_refinement_route():
     assert compiler_first_workflow_requested(multibranch) is False
     assert explicit_web_research_requested(multibranch) is False
     multibranch_tools = tools_for_message(multibranch, "free")
-    assert multibranch_tools == {
+    assert multibranch_tools == CANVAS_CHAT_TOOLS | {
         "compile_workflow_refinement_spec",
         "apply_workflow_graph_patch",
     }
@@ -646,8 +1169,6 @@ def test_existing_chain_edit_uses_only_atomic_refinement_route():
     assert "web_fetch_page" not in multibranch_tools
     assert "create_nodes" not in multibranch_tools
     assert "connect_nodes_batch" not in multibranch_tools
-    assert "workflow_overview" not in multibranch_tools
-    assert "workflow_get_current_json" not in multibranch_tools
     assert "node_knowledge_search" not in multibranch_tools
     assert "node_library_get_details" not in multibranch_tools
     # Referring to an image connection must not expose execution diagnostics.
@@ -689,8 +1210,11 @@ def test_existing_chain_edit_uses_only_atomic_refinement_route():
         "get_queue_status",
     } <= run_tools
 
-    # Outside refinement intent, image review keeps the richer diagnostic surface.
-    assert "comfy_get_logs" in tools_for_message("Please show me this image.")
+    # Outside refinement intent, image review keeps only output history and pixels.
+    assert tools_for_message("Please show me this image.") == CANVAS_CHAT_TOOLS | {
+        "get_execution_history",
+        "view_output_image",
+    }
 
     instructions = registry_discovery_instructions()
     assert "compile_workflow_refinement_spec" in instructions
@@ -710,7 +1234,7 @@ def test_existing_chain_edit_uses_only_atomic_refinement_route():
     assert "never accept an alphabetical guess" in prompt
     assert "prefers a direct compatible connection" in prompt
     assert "set `allow_inferred_converters=false`" in prompt
-    assert "verified lessons internally as ranking priors" in prompt
+    assert "reads the live graph and `/object_info`" in prompt
 
 
 def test_whole_branch_intents_use_only_the_pinned_pr35_routes():
@@ -734,12 +1258,16 @@ def test_whole_branch_intents_use_only_the_pinned_pr35_routes():
     }
     for message, (intent, expected_tools) in cases.items():
         assert workflow_branch_intent(message) == intent
-        assert tools_for_message(message, "free") == expected_tools
+        assert tools_for_message(message, "free") == (
+            CANVAS_CHAT_TOOLS | expected_tools
+        )
 
     # A branch used only as an edge anchor stays in the ordinary GraphPatch route.
     ordinary = "Add a Wavelet node after the upscale branch and don't run it."
     assert workflow_branch_intent(ordinary) is None
-    assert tools_for_message(ordinary, "free") == REFINEMENT_COMPILER_TOOLS
+    assert tools_for_message(ordinary, "free") == (
+        CANVAS_CHAT_TOOLS | REFINEMENT_COMPILER_TOOLS
+    )
 
     run_mutation = tools_for_message(
         "Clone the upscale branch, run it, and review the result.",
@@ -754,7 +1282,7 @@ def test_whole_branch_intents_use_only_the_pinned_pr35_routes():
     assert "compile_workflow_branch_operation" in prompt
     assert "resolve_workflow_branch_successor" in prompt
     assert "pending locator" in prompt
-    assert "never navigate from a label or fingerprint" in prompt
+    assert "Navigate only from an exact branch ID" in prompt
     assert "opaque bridge-issued security tokens" in prompt
     assert "never compare them with a serialized workflow `id`" in prompt
     assert "expected_workflow_identity" in prompt
@@ -800,7 +1328,8 @@ def test_exact_registry_request_gets_tools_and_source_guardrails():
     assert "use its verified alias-to-node-ID mapping" in instructions
 
     combined = ren_instructions("off")
-    assert instructions in combined
+    assert "Ren Registry rules" in combined
+    assert len(combined) < len(instructions) + 6_000
     assert "Web access is off" in combined
 
 
@@ -889,6 +1418,66 @@ def test_completed_run_retention_is_bounded(tmp_path):
 
     assert "one" not in runtime.runs
     assert set(runtime.runs) == {"two", "active"}
+
+
+@pytest.mark.asyncio
+async def test_embedded_mcp_worker_is_reused_and_closed(tmp_path, monkeypatch):
+    import pydantic_ai.mcp
+
+    created = []
+
+    class FakeServer:
+        def __init__(self, *args, **kwargs):
+            self.process_tool_call = kwargs["process_tool_call"]
+            self.entered = 0
+            self.exited = 0
+            created.append(self)
+
+        async def __aenter__(self):
+            self.entered += 1
+            return self
+
+        async def __aexit__(self, *_args):
+            self.exited += 1
+
+    monkeypatch.setattr(pydantic_ai.mcp, "MCPServerStdio", FakeServer)
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+
+    async def process(*_args):
+        return None
+
+    first = await runtime._get_mcp_worker(("same",), {}, process)
+    second = await runtime._get_mcp_worker(("same",), {}, process)
+
+    assert first is second
+    assert len(created) == 1
+    assert created[0].entered == 1
+    assert first.leases == 2
+    await runtime._release_mcp_worker(first)
+    await runtime._release_mcp_worker(second)
+    assert first.leases == 0
+    await runtime.shutdown()
+    assert created[0].exited == 1
+
+
+@pytest.mark.asyncio
+async def test_embedded_mcp_worker_startup_failure_is_actionable(tmp_path, monkeypatch):
+    import pydantic_ai.mcp
+
+    class FailedServer:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            raise ExceptionGroup("task group failed", [TimeoutError()])
+
+    monkeypatch.setattr(pydantic_ai.mcp, "MCPServerStdio", FailedServer)
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+
+    with pytest.raises(RuntimeError, match="Ren MCP tools failed to initialize"):
+        await runtime._get_mcp_worker(("failed",), {}, lambda *_args: None)
+
+    assert runtime._mcp_workers == {}
 
 
 def test_embedded_mcp_uses_loaded_bridge_port(monkeypatch):
@@ -1121,7 +1710,7 @@ async def test_claude_subscription_streams_tools_approvals_and_persists_session(
             options.mcp_servers["ren"]["env"]["FL_MCP_ALLOWED_TOOLS"].split(",")
         )
         assert "view_chat_image" in allowed_tool_names
-        assert "view_node_mask" in allowed_tool_names
+        assert "view_node_mask" not in allowed_tool_names
         assert callable(options.stderr)
         assert options.max_buffer_size == 8 * 1024 * 1024
 

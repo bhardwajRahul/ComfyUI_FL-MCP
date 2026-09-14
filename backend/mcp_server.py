@@ -60,7 +60,7 @@ from fastmcp import FastMCP, Context
 from fastmcp.tools.tool import ToolResult
 from fastmcp.utilities.types import Image as MCPImage
 from PIL import Image as PILImage, ImageOps, UnidentifiedImageError
-from pydantic import BaseModel, Field, StrictInt, StrictStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
 
 from config import DATA_DIR, MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS, settings
 from models import WorkflowQuery
@@ -105,6 +105,7 @@ from workflow_refinement import (
     normalize_workflow_graph,
 )
 from workflow_graph_patch import (
+    ApplyGraphPatchRequest,
     ApplyScopedGraphPatchRequest,
     GRAPH_PATCH_SCHEMA,
     MAX_GRAPH_PATCH_ATTACHMENT_BYTES,
@@ -400,72 +401,113 @@ class MCPWebSocketClient:
 
 _WS_CLIENT = None  # module-level singleton
 
+
+def _allowed_tools_from_environment() -> set[str] | None:
+    raw = os.getenv("FL_MCP_ALLOWED_TOOLS", "").strip()
+    if not raw:
+        return None
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def _tool_group_selected(
+    allowed_tools: set[str] | None,
+    *,
+    names: set[str] | None = None,
+    prefixes: tuple[str, ...] = (),
+) -> bool:
+    if allowed_tools is None:
+        return True
+    return bool((names or set()) & allowed_tools) or any(
+        name.startswith(prefix)
+        for name in allowed_tools
+        for prefix in prefixes
+    )
+
 @asynccontextmanager
 async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
     """Manage MCP server lifespan and persistent WebSocket connection."""
     global _WS_CLIENT
 
-    # Check if ComfyUI Manager is installed and initialize client
+    allowed_tools = _allowed_tools_from_environment()
     manager_client = None
     manager_available = False
     
     logger.info(f"FL_MCP_MODE: {os.getenv('FL_MCP_MODE')}")
     
-    try:
-        manager_client = get_comfy_manager_client(
-            server_url=settings.comfyui_server_url,
-            timeout=settings.comfyui_api_timeout
-        )
-        version_info = await manager_client.check_installed()
-        
-        if version_info.installed:
-            logger.info(f"[MCP] ComfyUI Manager detected (v{version_info.version})")
-            manager_available = True
-        else:
-            logger.warning("[MCP] ComfyUI Manager not installed - manager tools will return errors")
-    except Exception as e:
-        logger.warning(f"[MCP] Could not check Manager status: {e}")
+    if _tool_group_selected(allowed_tools, prefixes=("manager_",)):
+        try:
+            manager_client = get_comfy_manager_client(
+                server_url=settings.comfyui_server_url,
+                timeout=settings.comfyui_api_timeout
+            )
+            version_info = await manager_client.check_installed()
+
+            if version_info.installed:
+                logger.info(f"[MCP] ComfyUI Manager detected (v{version_info.version})")
+                manager_available = True
+            else:
+                logger.warning("[MCP] ComfyUI Manager not installed - manager tools will return errors")
+        except Exception as e:
+            logger.warning(f"[MCP] Could not check Manager status: {e}")
 
     node_catalog_store: NodeCatalogStore | None = None
-    node_library_client = get_node_library_client(
-        server_url=settings.comfyui_server_url,
-        timeout=settings.comfyui_api_timeout,
-    )
-    try:
-        node_catalog_store = NodeCatalogStore(DATA_DIR / "node_catalog.sqlite3")
-        node_library_client.bind_persistence(node_catalog_store)
-    except Exception as exc:
-        logger.warning("[MCP] Persistent node knowledge is unavailable: %s", exc)
-        if node_catalog_store is not None:
-            node_catalog_store.close()
-        node_catalog_store = None
+    node_library_client = None
+    if _tool_group_selected(
+        allowed_tools,
+        prefixes=("node_library_", "node_knowledge_", "compile_workflow_", "resolve_workflow_", "plan_workflow", "apply_workflow_"),
+    ):
+        node_library_client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        try:
+            node_catalog_store = NodeCatalogStore(DATA_DIR / "node_catalog.sqlite3")
+            node_library_client.bind_persistence(node_catalog_store)
+        except Exception as exc:
+            logger.warning("[MCP] Persistent node knowledge is unavailable: %s", exc)
+            if node_catalog_store is not None:
+                node_catalog_store.close()
+            node_catalog_store = None
 
-    web_cache = WebCache(DATA_DIR / "web_cache.sqlite3")
-    web_fetcher = AsyncWebFetcher()
-    web_pages = WebPageService(fetcher=web_fetcher, cache=web_cache)
-    web_search = WebSearchService(
-        mode=os.getenv("FL_MCP_WEB_SEARCH_MODE", "free"),
-        tavily_api_key=(
-            os.getenv("FL_MCP_TAVILY_API_KEY")
-            or os.getenv("TAVILY_API_KEY")
-        ),
-    )
+    web_cache = None
+    web_fetcher = None
+    web_pages = None
+    web_search = None
+    if _tool_group_selected(allowed_tools, names={"web_search", "web_fetch_page"}):
+        web_cache = WebCache(DATA_DIR / "web_cache.sqlite3")
+        web_fetcher = AsyncWebFetcher()
+        web_pages = WebPageService(fetcher=web_fetcher, cache=web_cache)
+        web_search = WebSearchService(
+            mode=os.getenv("FL_MCP_WEB_SEARCH_MODE", "free"),
+            tavily_api_key=(
+                os.getenv("FL_MCP_TAVILY_API_KEY")
+                or os.getenv("TAVILY_API_KEY")
+            ),
+        )
     web_images_allowed = (
         os.getenv("FL_MCP_MODE") != "subprocess"
         or os.getenv("FL_MCP_WEB_IMAGES_ALLOWED", "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
-    registry_client = ComfyRegistryClient()
+    registry_client = (
+        ComfyRegistryClient()
+        if _tool_group_selected(allowed_tools, prefixes=("registry_",))
+        else None
+    )
 
     async def close_web_resources() -> None:
-        await web_search.aclose()
-        await web_fetcher.aclose()
-        web_cache.close()
+        if web_search is not None:
+            await web_search.aclose()
+        if web_fetcher is not None:
+            await web_fetcher.aclose()
+        if web_cache is not None:
+            web_cache.close()
 
     def close_node_knowledge() -> None:
         if node_catalog_store is None:
             return
-        node_library_client.unbind_persistence(node_catalog_store)
+        if node_library_client is not None:
+            node_library_client.unbind_persistence(node_catalog_store)
         node_catalog_store.close()
 
     if os.getenv('FL_MCP_MODE') == 'subprocess':
@@ -527,6 +569,287 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
 
 # Initialize FastMCP server with lifespan
 mcp = FastMCP("ComfyUI FL-MCP", lifespan=mcp_lifespan)
+
+NATIVE_MODEL_RESULT_MAX_CHARS = 32 * 1024
+NATIVE_COMPILER_RESULT_MAX_CHARS = 8 * 1024
+NATIVE_READ_LIMITS = {
+    "query_workflow": 4,
+    "workflow_overview": 1,
+    "workflow_get_current_json": 1,
+    "get_layout": 1,
+}
+
+
+class WorkflowGraphPatchApplyHandle(BaseModel):
+    """Opaque native-provider reference to one compiler-owned apply envelope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    handle: str = Field(..., pattern=r"^[0-9a-f]{32}$")
+
+
+WorkflowGraphPatchApplyInput = (
+    WorkflowGraphPatchApplyRequest | WorkflowGraphPatchApplyHandle
+)
+
+
+def _native_turn_controls_enabled() -> bool:
+    return os.getenv("FL_MCP_NATIVE_TURN_CONTROLS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _native_turn_state(ctx: Context) -> Dict[str, Any]:
+    lifespan = ctx.request_context.lifespan_context
+    return lifespan.setdefault("ren_turn_state", {
+        "apply_handles": {},
+        "compile_attempts": 0,
+        "apply_attempts": 0,
+        "read_calls": {},
+        "completed_reads": set(),
+    })
+
+
+def _native_result_chars(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str))
+
+
+def _bounded_native_result(value: Any, depth: int = 0) -> Any:
+    if isinstance(value, str):
+        return value if len(value) <= 2_000 else value[:2_000] + "â€¦"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if depth >= 5:
+        return "[nested detail omitted]"
+    if isinstance(value, list):
+        return [_bounded_native_result(item, depth + 1) for item in value[:20]]
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_native_result(item, depth + 1)
+            for key, item in list(value.items())[:50]
+        }
+    return _bounded_native_result(str(value), depth)
+
+
+def _fit_native_result(value: Dict[str, Any], limit: int) -> Dict[str, Any]:
+    bounded = _bounded_native_result(value)
+    if _native_result_chars(bounded) <= limit:
+        return bounded
+    minimal = {
+        key: bounded[key]
+        for key in (
+            "valid", "success", "needs_choice", "compiler_schema", "patch_hash",
+            "error_count", "warning_count", "apply_handle", "compiler_attempt",
+            "compiler_attempts_remaining", "workflow_identity", "graph_hash",
+            "node_count", "link_count", "node_types", "count", "total", "offset",
+            "limit", "has_more", "next_offset", "format", "compacted",
+            "original_chars", "message",
+        )
+        if key in bounded
+    }
+    if isinstance(value.get("issues"), list):
+        minimal["issues"] = [
+            {
+                key: (item[key][:1_000] if isinstance(item.get(key), str) else item[key])
+                for key in ("severity", "code", "path", "message")
+                if key in item
+            }
+            for item in value["issues"][:6]
+            if isinstance(item, dict)
+        ]
+    return minimal
+
+
+def _workflow_snapshot_summary(result: Dict[str, Any]) -> Dict[str, Any]:
+    original_chars = _native_result_chars(result)
+    workflow = result.get("workflow")
+    nodes = workflow.get("nodes") if isinstance(workflow, dict) else None
+    if not isinstance(nodes, list):
+        output = result.get("output")
+        nodes = [
+            {"id": node_id, "type": item.get("class_type")}
+            for node_id, item in output.items()
+            if isinstance(item, dict)
+        ] if isinstance(output, dict) else []
+    links = workflow.get("links") if isinstance(workflow, dict) else None
+    node_types: Dict[str, int] = {}
+    summaries = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_type = str(node.get("type") or node.get("class_type") or "unknown")
+        node_types[node_type] = node_types.get(node_type, 0) + 1
+        if len(summaries) < 50:
+            summaries.append({
+                "id": node.get("id"),
+                "type": node_type,
+                "title": node.get("title"),
+            })
+    return {
+        "workflow_identity": result.get("workflow_identity"),
+        "graph_hash": result.get("graph_hash"),
+        "node_count": len(nodes),
+        "link_count": len(links) if isinstance(links, list) else None,
+        "node_types": dict(sorted(node_types.items())),
+        "nodes": summaries,
+        "compacted": True,
+        "original_chars": original_chars,
+        "message": "Use query_workflow for exact bounded node details.",
+    }
+
+
+def _native_read_result(tool_name: str, result: Any) -> ToolResult | Any:
+    if not _native_turn_controls_enabled():
+        return result
+    original_chars = _native_result_chars(result)
+    prepared = result
+    if original_chars > NATIVE_MODEL_RESULT_MAX_CHARS:
+        if tool_name == "workflow_get_current_json" and isinstance(result, dict):
+            prepared = _workflow_snapshot_summary(result)
+        elif tool_name == "query_workflow" and isinstance(result, dict):
+            prepared = {
+                **{
+                    key: result.get(key)
+                    for key in (
+                        "count", "total", "offset", "limit", "has_more", "next_offset",
+                        "format",
+                    )
+                },
+                "results": (result.get("results") or [])[:50],
+                "compacted": True,
+                "original_chars": original_chars,
+                "message": "Request a smaller limit or the next result page.",
+            }
+        elif tool_name == "get_layout" and isinstance(result, dict):
+            prepared = {
+                "nodes": (result.get("nodes") or [])[:100],
+                "count": result.get("count"),
+                "compacted": True,
+                "original_chars": original_chars,
+                "message": "The layout was truncated; request specific node IDs if needed.",
+            }
+        elif isinstance(result, dict):
+            prepared = {
+                **result,
+                "compacted": True,
+                "original_chars": original_chars,
+                "message": result.get("message") or (
+                    "The result exceeded Ren's live context limit; use a narrower query."
+                ),
+            }
+        else:
+            prepared = {
+                "compacted": True,
+                "original_chars": original_chars,
+                "message": "The result exceeded Ren's live context limit; use a narrower query.",
+            }
+        if isinstance(prepared, dict):
+            prepared = _fit_native_result(prepared, NATIVE_MODEL_RESULT_MAX_CHARS)
+    return ToolResult(content=prepared, structured_content=prepared)
+
+
+async def _native_read_tool(
+    ctx: Context,
+    tool_name: str,
+    parameters: Dict[str, Any],
+) -> ToolResult | Any:
+    if not _native_turn_controls_enabled():
+        return await _execute_tool(ctx, tool_name, parameters)
+    state = _native_turn_state(ctx)
+    fingerprint = hashlib.sha256(json.dumps(
+        [tool_name, parameters],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")).hexdigest()
+    if fingerprint in state["completed_reads"]:
+        _msg = {
+            "success": True,
+            "reused": True,
+            "message": "This identical read already succeeded; reuse its earlier result.",
+        }
+        return ToolResult(content=_msg, structured_content=_msg)
+    calls = state["read_calls"].get(tool_name, 0)
+    limit = NATIVE_READ_LIMITS[tool_name]
+    if calls >= limit:
+        _msg = {
+            "success": False,
+            "budget_exhausted": True,
+            "message": f"{tool_name} reached its per-turn limit; use the existing result.",
+        }
+        return ToolResult(content=_msg, structured_content=_msg)
+    state["read_calls"][tool_name] = calls + 1
+    result = await _execute_tool(ctx, tool_name, parameters)
+    if not (
+        isinstance(result, dict)
+        and (result.get("success") is False or result.get("error") is not None)
+    ):
+        state["completed_reads"].add(fingerprint)
+    return _native_read_result(tool_name, result)
+
+
+def _native_compiler_result(
+    ctx: Context,
+    result: Dict[str, Any],
+) -> ToolResult | Dict[str, Any]:
+    if not _native_turn_controls_enabled():
+        return result
+    state = _native_turn_state(ctx)
+    original_chars = _native_result_chars(result)
+    apply_request = result.get("apply_request")
+    prepared = {
+        "valid": result.get("valid") is True,
+        "compiler_schema": result.get("compiler_schema"),
+        "needs_choice": result.get("needs_choice", False),
+        "patch_hash": result.get("patch_hash"),
+        "catalog": result.get("catalog"),
+        "issues": result.get("issues", []),
+        "error_count": result.get("error_count", 0),
+        "warning_count": result.get("warning_count", 0),
+        "compiler_attempt": state["compile_attempts"],
+        "compiler_attempts_remaining": max(0, 2 - state["compile_attempts"]),
+        "compacted": original_chars > NATIVE_COMPILER_RESULT_MAX_CHARS,
+        "original_chars": original_chars,
+    }
+    if prepared["needs_choice"]:
+        prepared.update({
+            "selection": result.get("selection", []),
+            "resolution": result.get("resolution"),
+            "inferred_routes": result.get("inferred_routes", []),
+            "message": "Present the bounded compiler choices to the user; do not guess.",
+        })
+    elif prepared["valid"] and isinstance(apply_request, dict):
+        request_model: WorkflowGraphPatchApplyRequest
+        if isinstance((apply_request.get("plan") or {}).get("scope"), dict):
+            request_model = ApplyScopedGraphPatchRequest.model_validate(apply_request)
+        else:
+            request_model = ApplyGraphPatchRequest.model_validate(apply_request)
+        handle = uuid.uuid4().hex
+        state["apply_handles"][handle] = request_model
+        plan = apply_request.get("plan") or {}
+        prepared.update({
+            "apply_handle": handle,
+            "operation_counts": {
+                key: len(plan.get(key) or [])
+                for key in (
+                    "create_nodes", "update_nodes", "remove_nodes", "add_edges",
+                    "remove_edges", "attachments",
+                )
+            },
+            "message": "Apply this exact compiler result once using apply_handle.",
+        })
+    else:
+        prepared["message"] = (
+            "Correct only the reported validation issues and compile once more."
+            if state["compile_attempts"] < 2
+            else "The bounded compiler repair was used; report the remaining issues."
+        )
+    _prepared = _fit_native_result(
+        prepared,
+        NATIVE_COMPILER_RESULT_MAX_CHARS,
+    )
+    return ToolResult(content=_prepared, structured_content=_prepared)
 
 
 async def _execute_tool(ctx: Context, tool_name: str, parameters: Dict[str, Any], timeout_ms: Optional[int] = None) -> Dict[str, Any]:
@@ -2030,14 +2353,14 @@ async def web_fetch_page(request: WebFetchPageRequest, ctx: Context) -> Dict[str
 
 @mcp.tool()
 async def query_workflow(request: WorkflowQuery, ctx: Context) -> Dict[str, Any]:
-    """Query the workflow graph using structured filters, traversal, and aggregation."""
-    return await _execute_tool(ctx, "query_workflow", request.model_dump())
+    """Query the workflow graph with bounded filters, traversal, aggregation, and pagination. Prefer summary or ids results for inspection."""
+    return await _native_read_tool(ctx, "query_workflow", request.model_dump())
 
 
 @mcp.tool()
 async def workflow_overview(request: WorkflowOverviewRequest, ctx: Context) -> Dict[str, Any]:
     """Get a comprehensive overview of the current workflow."""
-    return await _execute_tool(ctx, "workflow_overview", {})
+    return await _native_read_tool(ctx, "workflow_overview", {})
 
 
 @mcp.tool()
@@ -2067,7 +2390,11 @@ async def frontend_list_keybindings(request: GetSystemInfoRequest, ctx: Context)
 @mcp.tool()
 async def workflow_get_current_json(request: WorkflowCurrentJsonRequest, ctx: Context) -> Dict[str, Any]:
     """Get the current workflow as editable JSON or API prompt JSON."""
-    return await _execute_tool(ctx, "workflow_get_current_json", request.model_dump())
+    return await _native_read_tool(
+        ctx,
+        "workflow_get_current_json",
+        request.model_dump(),
+    )
 
 
 @mcp.tool()
@@ -2586,7 +2913,7 @@ async def get_layout(request: GetLayoutRequest, ctx: Context) -> Dict[str, Any]:
         }
         
     """
-    return await _execute_tool(ctx, "get_layout", request.model_dump())
+    return await _native_read_tool(ctx, "get_layout", request.model_dump())
 
 
 # @mcp.tool()
@@ -4938,14 +5265,34 @@ async def compile_workflow_refinement_spec(
     one hash-pinned ``apply_request`` when valid. It never mutates or queues the
     canvas.
 
-    If ``valid=true``, pass ``apply_request`` unchanged to
-    ``apply_workflow_graph_patch``. Use lower-level JSON/search/details/planner
-    tools only when this compiler returns ``needs_choice`` or a classified
-    unsupported schema.
+    If ``valid=true``, pass ``apply_handle`` when returned; otherwise pass
+    ``apply_request`` unchanged to ``apply_workflow_graph_patch``. A native
+    provider may correct reported validation issues with one bounded second
+    compile. Use lower-level JSON/search/details/planner tools only when this
+    compiler returns ``needs_choice`` or a classified unsupported schema.
     """
 
     await _report_tool_activity(ctx, "compile_workflow_refinement_spec")
     try:
+        if _native_turn_controls_enabled():
+            state = _native_turn_state(ctx)
+            if state["apply_handles"]:
+                handle = next(reversed(state["apply_handles"]))
+                _msg = {
+                    "valid": True,
+                    "apply_handle": handle,
+                    "reused": True,
+                    "message": "A valid compiler result already exists; apply it once.",
+                }
+                return ToolResult(content=_msg, structured_content=_msg)
+            if state["compile_attempts"] >= 2:
+                _msg = {
+                    "valid": False,
+                    "budget_exhausted": True,
+                    "message": "The bounded compiler repair was used; report the remaining issues.",
+                }
+                return ToolResult(content=_msg, structured_content=_msg)
+            state["compile_attempts"] += 1
         active = await _active_editable_workflow(ctx)
         selected_node_ids = None
         if any(selector.selected for selector in request.existing_nodes):
@@ -4972,9 +5319,9 @@ async def compile_workflow_refinement_spec(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(force_refresh=False)
         attachment_values = _validated_plan_attachment_values(request)
-        return compile_semantic_refinement(
+        compiled = compile_semantic_refinement(
             request,
             active["workflow"],
             workflow_identity=active["workflow_identity"],
@@ -4986,6 +5333,7 @@ async def compile_workflow_refinement_spec(
             selected_node_ids=selected_node_ids,
             verified_lessons=_active_verified_capability_lessons(ctx),
         )
+        return _native_compiler_result(ctx, compiled)
     except NodeLibraryConnectionError as exc:
         raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
     except NodeLibraryError as exc:
@@ -5420,9 +5768,9 @@ def _attest_graph_patch_frontend_result(
 
 @mcp.tool()
 async def apply_workflow_graph_patch(
-    request: WorkflowGraphPatchApplyRequest,
+    request: WorkflowGraphPatchApplyInput,
     ctx: Context,
-) -> Dict[str, Any]:
+) -> Dict[str, Any] | ToolResult:
     """Atomically apply one unchanged semantic GraphPatch v2 or scoped v3 envelope.
 
     The backend rereads the active graph, refreshes the local node catalog, and
@@ -5436,8 +5784,31 @@ async def apply_workflow_graph_patch(
 
     await _report_tool_activity(ctx, "apply_workflow_graph_patch")
     if not settings.enable_workflow_writes:
-        return _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
+        return _native_read_result(
+            "apply_workflow_graph_patch",
+            _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES"),
+        )
     try:
+        if isinstance(request, WorkflowGraphPatchApplyHandle):
+            request = _native_turn_state(ctx)["apply_handles"].get(request.handle)
+            if request is None:
+                return _native_read_result("apply_workflow_graph_patch", {
+                    "success": False,
+                    "error": {
+                        "code": "invalid_apply_handle",
+                        "message": "The apply handle is invalid or expired; compile again.",
+                    },
+                })
+        if _native_turn_controls_enabled():
+            state = _native_turn_state(ctx)
+            if state["apply_attempts"] >= 1:
+                _msg = {
+                    "success": False,
+                    "budget_exhausted": True,
+                    "message": "GraphPatch apply already ran once in this turn.",
+                }
+                return ToolResult(content=_msg, structured_content=_msg)
+            state["apply_attempts"] += 1
         active = await _active_editable_workflow(ctx)
         empty_validation = {
             "valid": False,
@@ -5450,18 +5821,21 @@ async def apply_workflow_graph_patch(
         }
         attachment_issues = _graph_patch_attachment_integrity_issues(request)
         if attachment_issues:
-            return _graph_patch_failure(
-                request,
-                code="attachment_missing_or_changed",
-                message=(
-                    "A compiler-attested Ren chat image is missing or changed; "
-                    "compile the workflow refinement again."
+            return _native_read_result(
+                "apply_workflow_graph_patch",
+                _graph_patch_failure(
+                    request,
+                    code="attachment_missing_or_changed",
+                    message=(
+                        "A compiler-attested Ren chat image is missing or changed; "
+                        "compile the workflow refinement again."
+                    ),
+                    validation={
+                        **empty_validation,
+                        "issues": attachment_issues,
+                        "error_count": len(attachment_issues),
+                    },
                 ),
-                validation={
-                    **empty_validation,
-                    "issues": attachment_issues,
-                    "error_count": len(attachment_issues),
-                },
             )
         client = get_node_library_client(
             server_url=settings.comfyui_server_url,
@@ -5474,20 +5848,26 @@ async def apply_workflow_graph_patch(
             catalog=snapshot.data,
         )
         if completed is not None:
-            return completed
+            return _native_read_result("apply_workflow_graph_patch", completed)
         if active["workflow_identity"] != request.plan.expected_workflow_identity:
-            return _graph_patch_failure(
-                request,
-                code="workflow_identity_changed",
-                message="The active workflow tab changed; the canvas was not edited.",
-                validation=empty_validation,
+            return _native_read_result(
+                "apply_workflow_graph_patch",
+                _graph_patch_failure(
+                    request,
+                    code="workflow_identity_changed",
+                    message="The active workflow tab changed; the canvas was not edited.",
+                    validation=empty_validation,
+                ),
             )
         if active["graph_hash"] != request.plan.expected_graph_hash:
-            return _graph_patch_failure(
-                request,
-                code="graph_changed",
-                message="The active workflow graph changed; compile the refinement again.",
-                validation=empty_validation,
+            return _native_read_result(
+                "apply_workflow_graph_patch",
+                _graph_patch_failure(
+                    request,
+                    code="graph_changed",
+                    message="The active workflow graph changed; compile the refinement again.",
+                    validation=empty_validation,
+                ),
             )
         if isinstance(request, ApplyScopedGraphPatchRequest):
             canonical_request = scoped_graph_patch_request_from_apply(request)
@@ -5511,39 +5891,48 @@ async def apply_workflow_graph_patch(
             )
         validation = _graph_patch_validation_summary(compiled)
         if not compiled["valid"]:
-            return _graph_patch_failure(
-                request,
-                code="patch_invalid",
-                message="The graph patch is no longer valid; the canvas was not edited.",
-                validation=validation,
+            return _native_read_result(
+                "apply_workflow_graph_patch",
+                _graph_patch_failure(
+                    request,
+                    code="patch_invalid",
+                    message="The graph patch is no longer valid; the canvas was not edited.",
+                    validation=validation,
+                ),
             )
         if (
             compiled["patch_hash"] != request.patch_hash
             or compiled["plan"] != request.plan.model_dump(mode="json")
         ):
-            return _graph_patch_failure(
-                request,
-                code="patch_hash_mismatch",
-                message="The current canonical graph patch differs from the supplied plan.",
-                validation=validation,
+            return _native_read_result(
+                "apply_workflow_graph_patch",
+                _graph_patch_failure(
+                    request,
+                    code="patch_hash_mismatch",
+                    message="The current canonical graph patch differs from the supplied plan.",
+                    validation=validation,
+                ),
             )
         # Catalog refresh and recompilation are awaited operations. Recheck the
         # compiler-pinned bytes at the last backend boundary before the browser
         # is allowed to mutate the canvas, closing that apply-time TOCTOU gap.
         attachment_issues = _graph_patch_attachment_integrity_issues(request)
         if attachment_issues:
-            return _graph_patch_failure(
-                request,
-                code="attachment_missing_or_changed",
-                message=(
-                    "A compiler-attested Ren chat image is missing or changed; "
-                    "compile the workflow refinement again."
+            return _native_read_result(
+                "apply_workflow_graph_patch",
+                _graph_patch_failure(
+                    request,
+                    code="attachment_missing_or_changed",
+                    message=(
+                        "A compiler-attested Ren chat image is missing or changed; "
+                        "compile the workflow refinement again."
+                    ),
+                    validation={
+                        **empty_validation,
+                        "issues": attachment_issues,
+                        "error_count": len(attachment_issues),
+                    },
                 ),
-                validation={
-                    **empty_validation,
-                    "issues": attachment_issues,
-                    "error_count": len(attachment_issues),
-                },
             )
         result = await _execute_tool(
             ctx,
@@ -5567,7 +5956,10 @@ async def apply_workflow_graph_patch(
                 patch_hash=request.patch_hash,
                 application_id=request.application_id,
             )
-        return {**result, "validation": validation}
+        return _native_read_result(
+            "apply_workflow_graph_patch",
+            {**result, "validation": validation},
+        )
     except NodeLibraryConnectionError as exc:
         raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
     except NodeLibraryError as exc:
@@ -7250,10 +7642,9 @@ async def comfy_status(request: GetSystemInfoRequest, ctx: Context) -> Dict[str,
 
 async def _restrict_tools_from_environment() -> None:
     """Expose only the tools selected for an embedded chat run."""
-    raw = os.getenv("FL_MCP_ALLOWED_TOOLS", "").strip()
-    if not raw:
+    allowed = _allowed_tools_from_environment()
+    if allowed is None:
         return
-    allowed = {name.strip() for name in raw.split(",") if name.strip()}
     if hasattr(mcp, "list_tools"):
         registered = await mcp.list_tools(run_middleware=False)
     else:
@@ -7263,6 +7654,32 @@ async def _restrict_tools_from_environment() -> None:
         if tool.name not in allowed:
             mcp.remove_tool(tool.name)
             removed += 1
+        elif (
+            tool.name == "apply_workflow_graph_patch"
+            and _native_turn_controls_enabled()
+        ):
+            tool.parameters = {
+                "type": "object",
+                "properties": {
+                    "request": {
+                        "type": "object",
+                        "properties": {
+                            "handle": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{32}$",
+                                "description": "Opaque handle returned by the compiler.",
+                            },
+                        },
+                        "required": ["handle"],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["request"],
+                "additionalProperties": False,
+            }
+            tool.description = (
+                "Apply one compiler-owned GraphPatch using its opaque apply handle."
+            )
     logger.info(
         "[MCP] Restricted embedded tool surface to %s tools (%s removed)",
         len(allowed),

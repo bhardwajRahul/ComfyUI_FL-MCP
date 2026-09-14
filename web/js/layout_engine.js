@@ -34,6 +34,9 @@ export class LayoutEngine {
      * @param {number} multiplier - Spacing multiplier (1.0 = default, 1.5 = 50% more space)
      */
     setSpacingMultiplier(multiplier) {
+        if (!Number.isFinite(multiplier) || multiplier <= 0) {
+            throw new Error("Layout spacing multiplier must be greater than zero.");
+        }
         this.spacingMultiplier = multiplier;
         console.log(`[LayoutEngine] Spacing multiplier set to ${multiplier}`);
     }
@@ -50,15 +53,21 @@ export class LayoutEngine {
     }
 
     /**
-     * Main entry point - arrange nodes using specified strategy
-     * @param {Array<number>|null} nodeIds - Node IDs to arrange (null = all nodes)
+     * Calculate node positions without mutating the canvas.
+     * @param {Array<number|string>|null} nodeIds - Node IDs to arrange (null = all nodes)
      * @param {string} strategy - Layout strategy ("flow_horizontal", "flow_vertical", "grid")
-     * @param {object} options - Additional options
      * @returns {Array} Layout result with positions for each node
      */
-    arrangeNodes(nodeIds, strategy = "flow_horizontal", options = {}) {
+    calculateLayout(nodeIds, strategy = "flow_horizontal") {
         try {
-            console.log(`[LayoutEngine] Arranging nodes with strategy: ${strategy}`);
+            console.log(`[LayoutEngine] Calculating layout with strategy: ${strategy}`);
+
+            if ((this.app.graph?._groups || []).length > 0) {
+                throw new Error(
+                    "Automatic layout cannot safely preserve workflow groups. "
+                    + "Remove the groups or position nodes explicitly.",
+                );
+            }
 
             // Get nodes to arrange
             const nodes = this._getNodes(nodeIds);
@@ -85,14 +94,12 @@ export class LayoutEngine {
                     layout = this._grid(graph);
                     break;
                 default:
-                    console.warn(`[LayoutEngine] Unknown strategy "${strategy}", using flow_horizontal`);
-                    layout = this._flowHorizontal(graph);
+                    throw new Error(`Unsupported layout strategy: ${strategy}`);
             }
 
-            // Apply layout to actual nodes
-            this._applyLayout(layout);
+            this._anchorLayout(layout, nodes);
 
-            console.log(`[LayoutEngine] Layout complete: ${layout.length} nodes positioned`);
+            console.log(`[LayoutEngine] Layout calculated for ${layout.length} nodes`);
             return layout;
 
         } catch (error) {
@@ -201,7 +208,7 @@ export class LayoutEngine {
     /**
      * Get nodes from graph
      * @private
-     * @param {Array<number>|null} nodeIds - Node IDs (null = all nodes)
+     * @param {Array<number|string>|null} nodeIds - Node IDs (null = all nodes)
      * @returns {Array} Array of LiteGraph node objects
      */
     _getNodes(nodeIds) {
@@ -214,15 +221,41 @@ export class LayoutEngine {
             return [...this.app.graph._nodes];
         }
 
-        // Return specific nodes
+        // Return specific nodes. FL_API resolves titles to canonical IDs first.
+        const nodesById = new Map();
+        for (const node of this.app.graph._nodes) {
+            const key = String(node.id);
+            const matches = nodesById.get(key) || [];
+            matches.push(node);
+            nodesById.set(key, matches);
+        }
         const nodes = [];
         for (const id of nodeIds) {
-            const node = this.app.graph._nodes.find(n => n.id === id);
-            if (node) {
-                nodes.push(node);
+            const matches = nodesById.get(String(id)) || [];
+            if (matches.length !== 1) {
+                throw new Error(
+                    matches.length === 0
+                        ? `Layout node not found: ${String(id)}`
+                        : `Layout node ID is ambiguous: ${String(id)}`,
+                );
             }
+            nodes.push(matches[0]);
         }
         return nodes;
+    }
+
+    _anchorLayout(layout, nodes) {
+        if (layout.length === 0) return;
+        const sourceX = Math.min(...nodes.map(node => node.pos[0]));
+        const sourceY = Math.min(...nodes.map(node => node.pos[1]));
+        const layoutX = Math.min(...layout.map(item => item.x));
+        const layoutY = Math.min(...layout.map(item => item.y));
+        const offsetX = sourceX - layoutX;
+        const offsetY = sourceY - layoutY;
+        for (const item of layout) {
+            item.x += offsetX;
+            item.y += offsetY;
+        }
     }
 
     /**
@@ -559,24 +592,4 @@ export class LayoutEngine {
         return columns;
     }
 
-    /**
-     * Apply calculated layout to actual nodes
-     * @private
-     * @param {Array} layout - Layout result
-     */
-    _applyLayout(layout) {
-        for (const item of layout) {
-            const node = this.app.graph._nodes.find(n => n.id === item.node_id);
-            if (node) {
-                node.pos[0] = item.x;
-                node.pos[1] = item.y;
-                // Note: we don't change size, only position
-            }
-        }
-
-        // Trigger canvas redraw
-        if (this.app.canvas) {
-            this.app.canvas.setDirty(true, true);
-        }
-    }
 }

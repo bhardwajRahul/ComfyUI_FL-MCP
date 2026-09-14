@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field, StrictInt, StrictStr, model_validator
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 REQUIRED_FRONTEND_TOOL_CONTRACT_REVISIONS = {
     "apply_workflow_graph_patch": 3,
+    "get_layout": 2,
+    "modify_layout": 2,
 }
 ToolContractRevision = Annotated[StrictInt, Field(ge=1, le=2_147_483_647)]
 
@@ -256,8 +258,10 @@ class WorkflowQuery(BaseModel):
     result_format: Literal["full", "summary", "ids", "scalar", "diagram"] = Field(
         "full", description="Result format"
     )
-    limit: Optional[int] = Field(None, description="Maximum results")
-    offset: Optional[int] = Field(0, description="Result offset")
+    limit: Optional[int] = Field(None, ge=1, le=500, description="Maximum results")
+    offset: int = Field(0, ge=0, description="Result offset")
+    include_connections: bool = Field(False, description="Include connection details in full results")
+    include_position: bool = Field(False, description="Include position and size in full results")
 
 
 class SessionContext(BaseModel):

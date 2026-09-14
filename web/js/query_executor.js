@@ -38,6 +38,8 @@ export class QueryExecutor {
                 nodes = this.applyTraversal(nodes, query.traversal);
             }
 
+            const total = nodes.length;
+
             // Apply sorting
             if (query.sort) {
                 nodes = this.applySort(nodes, query.sort);
@@ -57,9 +59,17 @@ export class QueryExecutor {
 
             // Format results - wrap in object for MCP compatibility
             const results = this.formatResults(nodes, query);
+            const offset = query.offset || 0;
+            const count = nodes.length;
+            const hasMore = offset + count < total;
             return {
                 results,
-                count: results.length,
+                count,
+                total,
+                offset,
+                limit: query.limit ?? null,
+                has_more: hasMore,
+                next_offset: hasMore ? offset + count : null,
                 format: query.result_format || 'full'
             };
         } catch (error) {
@@ -94,6 +104,9 @@ export class QueryExecutor {
      * @returns {Array} Filtered nodes
      */
     applyFilters(nodes, filterGroup) {
+        if (filterGroup.field) {
+            return nodes.filter(node => this.evaluateFilter(node, filterGroup));
+        }
         const { operator, filters, groups } = filterGroup;
         
         return nodes.filter(node => {

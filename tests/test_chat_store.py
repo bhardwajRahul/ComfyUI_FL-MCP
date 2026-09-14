@@ -1,9 +1,10 @@
+import json
 import sqlite3
 
-from chat_store import ChatStore
+from chat_store import TOOL_TIMELINE_MAX_CHARS, ChatStore, compact_tool_steps
 
 
-def test_conversation_crud_and_serialized_history(tmp_path):
+def test_conversation_crud_and_tool_history(tmp_path):
     store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
     conversation = store.create_conversation(provider="lmstudio", model="model")
     assert conversation["title"] == "New chat"
@@ -13,14 +14,12 @@ def test_conversation_crud_and_serialized_history(tmp_path):
         conversation["id"],
         "assistant",
         "world",
-        serialized=[{"kind": "response"}],
         metadata={"toolSteps": [{"name": "workflow_overview"}]},
     )
 
     messages = store.list_messages(conversation["id"])
     assert [item["content"] for item in messages] == ["hello", "world"]
     assert messages[-1]["metadata"]["toolSteps"][0]["name"] == "workflow_overview"
-    assert store.serialized_history(conversation["id"]) is not None
 
     store.update_conversation(conversation["id"], title="Renamed")
     assert store.get_conversation(conversation["id"])["title"] == "Renamed"
@@ -39,6 +38,41 @@ def test_conversation_crud_and_serialized_history(tmp_path):
     assert store.get_conversation(conversation["id"])["archivedAt"] is None
     assert store.delete_conversation(conversation["id"])
     assert store.get_conversation(conversation["id"]) is None
+
+
+def test_tool_history_is_bounded_for_new_and_legacy_rows(tmp_path):
+    huge_result = json.dumps({"workflow": "x" * 1_000_000})
+    compacted = compact_tool_steps([{
+        "id": "tool-1",
+        "name": "workflow_get_current_json",
+        "status": "done",
+        "arguments": "y" * 20_000,
+        "result": huge_result,
+        "startedAt": "2026-08-14T00:00:00+00:00",
+        "completedAt": "2026-08-14T00:00:01+00:00",
+        "durationMs": 1000,
+        "resultChars": len(huge_result),
+    }])
+    assert len(compacted[0]["arguments"]) <= 8 * 1024 + 100
+    assert len(compacted[0]["result"]) <= 16 * 1024 + 100
+    assert len(json.dumps(compacted)) <= TOOL_TIMELINE_MAX_CHARS
+    assert compacted[0]["durationMs"] == 1000
+    assert compacted[0]["resultChars"] == len(huge_result)
+
+    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
+    conversation = store.create_conversation()
+    store.append_message(
+        conversation["id"],
+        "assistant",
+        "done",
+        metadata={"toolSteps": [{
+            "name": "workflow_get_current_json",
+            "status": "done",
+            "result": huge_result,
+        }]},
+    )
+    response = store.list_messages(conversation["id"])
+    assert len(json.dumps(response)) < 50_000
 
 
 def test_conversation_list_rejects_unknown_view(tmp_path):

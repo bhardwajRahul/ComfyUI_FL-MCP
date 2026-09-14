@@ -17,6 +17,29 @@ def test_settings_store_contains_no_credentials(tmp_path):
     assert all("key" not in key.lower() for key in saved)
 
 
+@pytest.mark.parametrize("provider, port", [("lmstudio", 1234), ("ollama", 11434)])
+def test_local_openai_compatible_urls_add_v1_path(tmp_path, provider, port):
+    store = ChatSettingsStore(tmp_path / "settings.json")
+
+    value = store.update({
+        "provider": provider,
+        "base_url": f"http://192.168.1.10:{port}",
+    })
+
+    assert value["base_url"] == f"http://192.168.1.10:{port}/v1"
+
+
+def test_custom_openai_compatible_url_preserves_root_path(tmp_path):
+    store = ChatSettingsStore(tmp_path / "settings.json")
+
+    value = store.update({
+        "provider": "custom",
+        "base_url": "http://192.168.1.10:8000",
+    })
+
+    assert value["base_url"] == "http://192.168.1.10:8000"
+
+
 def test_settings_reject_secret_fields(tmp_path):
     store = ChatSettingsStore(tmp_path / "settings.json")
     with pytest.raises(ValueError, match="credential"):

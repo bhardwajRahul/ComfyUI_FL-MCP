@@ -306,3 +306,45 @@ def test_startup_failure_is_retained_for_frontend_diagnostics(tmp_path, monkeypa
     assert "fl_mcp_server.log" in runner.last_error
     runner.process = None
     runner.cleanup()
+
+
+def test_existing_monitor_thread_is_not_duplicated(monkeypatch):
+    runner = server_runner.ServerRunner(BACKEND_DIR, auto_start=False)
+    threads = []
+
+    class FakeThread:
+        def __init__(self, **_kwargs):
+            self.alive = False
+            threads.append(self)
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+    monkeypatch.setattr(server_runner.threading, "Thread", FakeThread)
+
+    runner._start_monitoring()
+    runner._start_monitoring()
+
+    assert len(threads) == 1
+    runner.cleanup()
+
+
+def test_occupied_port_does_not_hide_failed_child(monkeypatch):
+    runner = server_runner.ServerRunner(BACKEND_DIR, auto_start=False)
+    runner.active_mode = "subprocess"
+    monkeypatch.setattr(runner, "is_port_in_use", lambda: True)
+
+    class FailedProcess:
+        @staticmethod
+        def poll():
+            return 1
+
+    runner.process = FailedProcess()
+
+    assert runner.wait_for_server(timeout=0.1) is False
+    assert "exited during startup with code 1" in runner.last_error
+    runner.process = None
+    runner.cleanup()

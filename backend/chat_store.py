@@ -15,6 +15,9 @@ from chat_config import DATA_DIR, PROJECT_ROOT
 
 DB_PATH = DATA_DIR / "chat.db"
 LEGACY_DB_PATH = PROJECT_ROOT / ".ren" / "ren.db"
+TOOL_ARGUMENT_MAX_CHARS = 8 * 1024
+TOOL_RESULT_MAX_CHARS = 16 * 1024
+TOOL_TIMELINE_MAX_CHARS = 128 * 1024
 
 
 def utc_now() -> str:
@@ -28,6 +31,119 @@ def _loads(value: Optional[str], fallback: Any) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return fallback
+
+
+def _redact_tool_binary(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_redact_tool_binary(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: (
+            "[image content shown to Ren]"
+            if value.get("type") == "image" and key == "data"
+            else _redact_tool_binary(item)
+        )
+        for key, item in value.items()
+    }
+
+
+def _detail_text(value: Any) -> tuple[Any, str, bool]:
+    parsed = value
+    was_string = isinstance(value, str)
+    if was_string:
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = value
+    parsed = _redact_tool_binary(parsed)
+    text = (
+        parsed
+        if isinstance(parsed, str)
+        else json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+    )
+    return parsed, text, was_string
+
+
+def _bounded_tool_detail(value: Any, limit: int, *, tool_name: str = "") -> Any:
+    parsed, text, was_string = _detail_text(value)
+    if len(text) <= limit:
+        if was_string:
+            try:
+                if parsed == json.loads(value):
+                    return value
+            except json.JSONDecodeError:
+                return value
+            return text
+        return parsed
+
+    if isinstance(parsed, dict):
+        retained_keys = {
+            "success", "error", "message", "status", "summary", "total_nodes",
+            "node_count", "prompt_id", "displayImages", "workflowDelta", "mask",
+        }
+        if tool_name == "view_output_image":
+            retained_keys.add("image")
+        if tool_name == "web_fetch_page":
+            retained_keys.add("images")
+        compact = {
+            key: parsed[key]
+            for key in retained_keys
+            if key in parsed
+        }
+        compact["_truncated"] = f"Persisted result omitted {len(text) - limit:,} characters."
+        compact_text = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        if len(compact_text) <= limit:
+            return compact_text if was_string else compact
+
+    suffix = f"\n… [persisted detail truncated from {len(text):,} characters]"
+    return text[: max(0, limit - len(suffix))] + suffix
+
+
+def compact_tool_steps(tool_steps: Any) -> list[dict[str, Any]]:
+    """Bound tool metadata while retaining the newest call statuses and useful refs."""
+    if not isinstance(tool_steps, list):
+        return []
+    compacted = []
+    for raw_step in tool_steps:
+        if not isinstance(raw_step, dict):
+            continue
+        step = {
+            key: raw_step[key]
+            for key in (
+                "id", "name", "status", "risk", "contentOffset",
+                "startedAt", "completedAt", "durationMs",
+                "argumentChars", "resultChars", "modelResultChars",
+                "compacted", "reused",
+            )
+            if key in raw_step
+        }
+        tool_name = str(step.get("name") or "")
+        if raw_step.get("arguments") not in (None, ""):
+            step["arguments"] = _bounded_tool_detail(
+                raw_step["arguments"],
+                TOOL_ARGUMENT_MAX_CHARS,
+            )
+        if raw_step.get("result") not in (None, ""):
+            step["result"] = _bounded_tool_detail(
+                raw_step["result"],
+                TOOL_RESULT_MAX_CHARS,
+                tool_name=tool_name,
+            )
+        compacted.append(step)
+
+    def encoded_size() -> int:
+        return len(json.dumps(compacted, ensure_ascii=False, separators=(",", ":")))
+
+    for detail in ("result", "arguments"):
+        for step in compacted:
+            if encoded_size() <= TOOL_TIMELINE_MAX_CHARS:
+                return compacted
+            if detail in step:
+                step[detail] = "[omitted from persisted history]"
+    while len(compacted) > 1 and encoded_size() > TOOL_TIMELINE_MAX_CHARS:
+        compacted.pop(0)
+    return compacted
 
 
 class ChatStore:
@@ -471,17 +587,7 @@ class ChatStore:
                 for row in rows
                 if row["role"] == "user" and row["revision_root_id"]
             }
-            counts = {}
-            for root_id in roots:
-                count_row = connection.execute(
-                    """
-                    SELECT COUNT(*) AS count FROM messages
-                    WHERE conversation_id = ? AND revision_root_id = ?
-                          AND role = 'user'
-                    """,
-                    (conversation_id, root_id),
-                ).fetchone()
-                counts[root_id] = int(count_row["count"])
+            counts = self._revision_counts(connection, conversation_id, roots)
         return [
             self._message(
                 row,
@@ -543,17 +649,7 @@ class ChatStore:
                 for row in rows
                 if row["role"] == "user" and row["revision_root_id"]
             }
-            counts = {}
-            for root_id in roots:
-                count_row = connection.execute(
-                    """
-                    SELECT COUNT(*) AS count FROM messages
-                    WHERE conversation_id = ? AND revision_root_id = ?
-                          AND role = 'user'
-                    """,
-                    (conversation_id, root_id),
-                ).fetchone()
-                counts[root_id] = int(count_row["count"])
+            counts = self._revision_counts(connection, conversation_id, roots)
         messages = [
             self._message(
                 row,
@@ -658,23 +754,6 @@ class ChatStore:
                 (leaf["id"], utc_now(), conversation_id),
             )
         return self.list_messages(conversation_id)
-
-    def serialized_history(self, conversation_id: str) -> Optional[bytes]:
-        message_ids = [item["id"] for item in self.list_messages(conversation_id)]
-        if not message_ids:
-            return None
-        placeholders = ",".join("?" for _ in message_ids)
-        with self._lock, self._connect() as connection:
-            row = connection.execute(
-                f"""
-                SELECT serialized_json FROM messages
-                WHERE id IN ({placeholders}) AND role = 'assistant'
-                      AND serialized_json IS NOT NULL
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                message_ids,
-            ).fetchone()
-        return str(row["serialized_json"]).encode("utf-8") if row else None
 
     def create_run(self, run_id: str, conversation_id: str) -> None:
         with self._lock, self._connect() as connection:
@@ -818,12 +897,35 @@ class ChatStore:
         }
 
     @staticmethod
+    def _revision_counts(
+        connection: sqlite3.Connection,
+        conversation_id: str,
+        roots: set[str],
+    ) -> dict[str, int]:
+        if not roots:
+            return {}
+        placeholders = ",".join("?" for _ in roots)
+        rows = connection.execute(
+            f"""
+            SELECT revision_root_id, COUNT(*) AS count FROM messages
+            WHERE conversation_id = ? AND role = 'user'
+                  AND revision_root_id IN ({placeholders})
+            GROUP BY revision_root_id
+            """,
+            (conversation_id, *sorted(roots)),
+        ).fetchall()
+        return {str(row["revision_root_id"]): int(row["count"]) for row in rows}
+
+    @staticmethod
     def _message(
         row: sqlite3.Row,
         *,
         revision_count: int = 1,
     ) -> Dict[str, Any]:
         revision_root_id = row["revision_root_id"] or row["id"]
+        metadata = _loads(row["metadata_json"], {})
+        if isinstance(metadata, dict) and "toolSteps" in metadata:
+            metadata["toolSteps"] = compact_tool_steps(metadata["toolSteps"])
         return {
             "id": row["id"],
             "conversationId": row["conversation_id"],
@@ -833,7 +935,7 @@ class ChatStore:
             "provider": row["provider"],
             "model": row["model"],
             "createdAt": row["created_at"],
-            "metadata": _loads(row["metadata_json"], {}),
+            "metadata": metadata,
             "parentMessageId": row["parent_message_id"],
             "revision": {
                 "rootId": revision_root_id,

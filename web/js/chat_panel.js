@@ -76,6 +76,10 @@ export class AssistantPanel {
         this.initializing = false;
         this.currentAssistant = null;
         this.currentRunContext = null;
+        this.runPhaseTimer = null;
+        this.runPhaseStartedAt = 0;
+        this.runPhaseLabel = "";
+        this.runPhaseIcon = "pi pi-spin pi-spinner";
         this.availableModels = [];
         this.pendingSubscriptionModel = null;
         this.diagnostics = null;
@@ -2560,6 +2564,7 @@ export class AssistantPanel {
         message.source = "";
         message.activeBody = message.body;
         message.activeSource = "";
+        message.activeTextNode = null;
         message.pendingText = "";
         message.textRenderFrame = null;
         if (message.activeBody) message.activeBody.classList.add("streaming-active");
@@ -2586,9 +2591,13 @@ export class AssistantPanel {
             message.timeline.appendChild(message.activeBody);
             message.activeBody.classList.add("streaming-active");
         }
+        if (!message.activeTextNode) {
+            message.activeTextNode = document.createTextNode("");
+            message.activeBody.appendChild(message.activeTextNode);
+        }
         message.activeSource += message.pendingText;
+        message.activeTextNode.appendData(message.pendingText);
         message.pendingText = "";
-        message.activeBody.replaceChildren(this.renderChatMarkdown(message.activeSource));
         message.body = message.activeBody;
     }
 
@@ -2600,10 +2609,13 @@ export class AssistantPanel {
         this.flushAssistantText(message);
         if (discardEmpty && message.activeBody && !message.activeSource) {
             message.activeBody.remove();
+        } else if (message.activeBody && message.activeSource) {
+            message.activeBody.replaceChildren(this.renderChatMarkdown(message.activeSource));
         }
         message.activeBody?.classList.remove("streaming-active");
         message.activeBody = null;
         message.activeSource = "";
+        message.activeTextNode = null;
         message.pendingText = "";
     }
 
@@ -2789,10 +2801,30 @@ export class AssistantPanel {
         const pre = document.createElement("pre");
         technical.append(detailLabel, pre);
         card.append(summary, technical);
+        card.addEventListener("toggle", () => {
+            if (card.open) this.renderToolTechnical(card, card.toolStep);
+        });
         return card;
     }
 
+    renderToolTechnical(card, step) {
+        if (!card || !step) return;
+        const technicalSections = [];
+        if (step.arguments !== undefined && step.arguments !== "") {
+            technicalSections.push(`Arguments\n${technicalText(step.arguments)}`);
+        }
+        if (step.result !== undefined && step.result !== "") {
+            technicalSections.push(`Result\n${technicalText(step.result)}`);
+        }
+        const technical = card.querySelector(".fl-tool-technical");
+        technical.hidden = technicalSections.length === 0;
+        technical.querySelector("pre").textContent = technicalText(
+            technicalSections.join("\n\n"),
+        );
+    }
+
     renderToolHistoryCard(card, step) {
+        card.toolStep = step;
         const visualStatus = this.toolVisualStatus(step.status);
         const tool = getToolConfig(step.name);
         card.className = `fl-toolchain-crumb ${visualStatus}`;
@@ -2807,25 +2839,23 @@ export class AssistantPanel {
         card.querySelector(".fl-crumb-description").textContent = visualStatus === "loading"
             ? (tool.description || tool.label || step.name || "MCP tool")
             : (tool.label || step.name || "MCP tool");
-        card.querySelector(".fl-crumb-status").textContent = {
+        const status = {
             loading: "Working",
             completed: "Done",
             retried: "Retried",
             failed: "Failed",
             cancelled: step.status === "interrupted" ? "Interrupted" : "Stopped",
         }[visualStatus];
-        const technicalSections = [];
-        if (step.arguments !== undefined && step.arguments !== "") {
-            technicalSections.push(`Arguments\n${technicalText(step.arguments)}`);
-        }
-        if (step.result !== undefined && step.result !== "") {
-            technicalSections.push(`Result\n${technicalText(step.result)}`);
-        }
+        card.querySelector(".fl-crumb-status").textContent = step.durationMs === undefined
+            ? status
+            : `${status} · ${this.formatDuration(step.durationMs)}`;
         const technical = card.querySelector(".fl-tool-technical");
-        technical.hidden = technicalSections.length === 0;
-        technical.querySelector("pre").textContent = technicalText(
-            technicalSections.join("\n\n"),
+        technical.hidden = !(
+            (step.arguments !== undefined && step.arguments !== "")
+            || (step.result !== undefined && step.result !== "")
         );
+        if (card.open) this.renderToolTechnical(card, step);
+        else technical.querySelector("pre").textContent = "";
     }
 
     toggleToolHistory(rail) {
@@ -3039,9 +3069,9 @@ export class AssistantPanel {
             if (message.runId) message.article.dataset.runId = message.runId;
             if (context && context === this.currentRunContext && this.steering) {
                 this.steering = false;
-                this.setRunStatus("Ren is working…");
                 this.updateComposerState();
             }
+            this.startRunPhase("Ren is reasoning…");
             this.announce("Ren started working.");
         } else if (event.type === "TEXT_MESSAGE_START") {
             this.ensureAssistantMessage(context);
@@ -3050,6 +3080,7 @@ export class AssistantPanel {
             const delta = event.delta || "";
             message.source += delta;
             this.appendAssistantDelta(message, delta);
+            this.startRunPhase("Ren is responding…", "pi pi-pencil");
         } else if (event.type === "TOOL_CALL_START") {
             const message = this.ensureAssistantMessage(context);
             const id = event.toolCallId || crypto.randomUUID();
@@ -3063,6 +3094,7 @@ export class AssistantPanel {
                 name: event.toolCallName,
                 status: "running",
                 arguments: "",
+                startedAtMs: Date.now(),
             };
             const history = this.addToolStep(this.toolRailAtCursor(message), step);
             message.tools.set(id, {
@@ -3073,7 +3105,7 @@ export class AssistantPanel {
                 step,
             });
             const toolConfig = getToolConfig(event.toolCallName);
-            this.setRunStatus(toolConfig.runningLabel, toolConfig.iconClass);
+            this.startRunPhase(toolConfig.runningLabel, toolConfig.iconClass);
         } else if (event.type === "TOOL_CALL_ARGS") {
             const tool = (context?.assistant || this.currentAssistant)?.tools.get(
                 event.toolCallId,
@@ -3096,6 +3128,7 @@ export class AssistantPanel {
         } else if (event.type === "CUSTOM" && event.name === "approval_resolved") {
             this.resolveApprovalCard(event.value);
         } else if (event.type === "RUN_ERROR") {
+            this.stopRunPhase();
             const interrupted = event.code === "steered";
             this.settleOpenTools(
                 interrupted ? "interrupted" : event.code === "cancelled" ? "cancelled" : "failed",
@@ -3115,6 +3148,7 @@ export class AssistantPanel {
                 this.updateComposerState();
             }
         } else if (event.type === "RUN_FINISHED") {
+            this.stopRunPhase();
             this.settleOpenTools("finished", context?.assistant || this.currentAssistant);
             this.finishAssistantMessage(context?.assistant || this.currentAssistant);
             if (!context || context === this.currentRunContext) {
@@ -3129,6 +3163,9 @@ export class AssistantPanel {
     setToolStatus(tool, status, result = undefined) {
         tool.status = status;
         tool.step.status = status;
+        if (tool.step.startedAtMs && tool.step.durationMs === undefined) {
+            tool.step.durationMs = Math.max(0, Date.now() - tool.step.startedAtMs);
+        }
         if (result !== undefined) tool.step.result = result;
         this.scheduleToolHistoryRender(tool.history, {
             details: tool.history.expanded,
@@ -3358,7 +3395,7 @@ export class AssistantPanel {
 
     async steer(message, attachments, searchMode) {
         this.steering = true;
-        this.setRunStatus("Steering Ren…", "pi pi-send");
+        this.startRunPhase("Steering Ren…", "pi pi-send");
         this.updateComposerState();
         try {
             const activeRunId = this.chat.runId || await this.chat.runReady;
@@ -3378,7 +3415,7 @@ export class AssistantPanel {
             this.showError(`Message could not steer the response: ${error.message}`);
         } finally {
             this.steering = false;
-            if (this.running) this.setRunStatus("Ren is working…");
+            if (this.running) this.startRunPhase("Ren is reasoning…");
             this.updateComposerState();
         }
     }
@@ -3597,7 +3634,7 @@ export class AssistantPanel {
         if (!this.running || this.stopping || this.steering) return;
         const activeRun = this.activeRunPromise;
         this.stopping = true;
-        this.setRunStatus("Stopping Ren…", "pi pi-stop-circle");
+        this.startRunPhase("Stopping Ren…", "pi pi-stop-circle");
         this.updateComposerState();
         try {
             const cancelled = await this.chat.cancel();
@@ -3609,7 +3646,7 @@ export class AssistantPanel {
             this.showError(`Response could not be stopped: ${error.message}`);
         } finally {
             this.stopping = false;
-            if (this.running) this.setRunStatus("Ren is working…");
+            if (this.running) this.startRunPhase("Ren is reasoning…");
             this.updateComposerState();
         }
     }
@@ -3619,15 +3656,45 @@ export class AssistantPanel {
         this.runStatusIcon.className = `${iconClass} fl-run-status-icon`;
     }
 
+    formatDuration(durationMs) {
+        const milliseconds = Math.max(0, Math.round(Number(durationMs) || 0));
+        if (milliseconds < 1_000) return `${milliseconds}ms`;
+        const seconds = milliseconds / 1_000;
+        return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`;
+    }
+
+    renderRunPhase() {
+        if (!this.runPhaseLabel) return;
+        const seconds = Math.max(0, Math.floor((Date.now() - this.runPhaseStartedAt) / 1_000));
+        this.setRunStatus(`${this.runPhaseLabel} · ${seconds}s`, this.runPhaseIcon);
+    }
+
+    startRunPhase(label, iconClass = "pi pi-spin pi-spinner") {
+        if (this.runPhaseLabel === label && this.runPhaseIcon === iconClass) return;
+        this.stopRunPhase();
+        this.runPhaseLabel = label;
+        this.runPhaseIcon = iconClass;
+        this.runPhaseStartedAt = Date.now();
+        this.renderRunPhase();
+        this.runPhaseTimer = globalThis.setInterval?.(() => this.renderRunPhase(), 1_000) ?? null;
+    }
+
+    stopRunPhase() {
+        if (this.runPhaseTimer !== null) globalThis.clearInterval?.(this.runPhaseTimer);
+        this.runPhaseTimer = null;
+        this.runPhaseStartedAt = 0;
+        this.runPhaseLabel = "";
+    }
+
     setRunStatusForActiveTool(message) {
         const tools = [...(message?.tools?.values() || [])];
         for (let index = tools.length - 1; index >= 0; index--) {
             if (tools[index].status !== "running") continue;
             const config = getToolConfig(tools[index].name);
-            this.setRunStatus(config.runningLabel, config.iconClass);
+            this.startRunPhase(config.runningLabel, config.iconClass);
             return;
         }
-        this.setRunStatus("Ren is working…");
+        this.startRunPhase("Waiting for Ren…");
     }
 
     updateComposerState() {
@@ -3647,7 +3714,10 @@ export class AssistantPanel {
         this.stopButton.disabled = this.stopping || this.steering;
         this.stopButton.textContent = this.stopping ? "Stopping…" : "Stop";
         this.textarea.disabled = false;
-        if (!this.running) this.setRunStatus("Ren is working…");
+        if (!this.running) {
+            this.stopRunPhase();
+            this.setRunStatus("Ren is working…");
+        }
         if (this.running) {
             this.textarea.setAttribute("aria-describedby", "fl-run-drafting-hint");
         } else {
@@ -4075,6 +4145,7 @@ export class AssistantPanel {
     }
 
     destroy() {
+        this.stopRunPhase();
         this.chat.detach();
         this.diagnostics?.destroy();
         this.contextUnsubscribe?.();

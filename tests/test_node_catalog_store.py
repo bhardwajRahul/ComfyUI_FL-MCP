@@ -116,6 +116,26 @@ def test_invalid_hash_or_oversized_json_cannot_replace_last_valid_snapshot(tmp_p
         store.close()
 
 
+def test_unchanged_reconcile_refreshes_freshness_without_new_generation(tmp_path):
+    now = [100.0]
+    store = NodeCatalogStore(tmp_path / "catalog.sqlite3", clock=lambda: now[0])
+    catalog = {"LoadImage": node_info(display_name="Load Image")}
+    try:
+        first = store.reconcile(catalog, source="first/object_info")
+        now[0] = 200.0
+        unchanged = store.reconcile(catalog, source="second/object_info")
+
+        assert unchanged.generation == first.generation == 1
+        assert unchanged.unchanged_count == 1
+        assert unchanged.new_count == unchanged.changed_count == unchanged.removed_count == 0
+        assert store.get_node("LoadImage")["last_seen_generation"] == 1
+        snapshot = store.get_snapshot()
+        assert snapshot.source == "second/object_info"
+        assert snapshot.fetched_at == 200.0
+    finally:
+        store.close()
+
+
 def test_failed_refresh_serves_last_valid_snapshot_as_stale(tmp_path):
     now = [100.0]
     store = NodeCatalogStore(tmp_path / "catalog.sqlite3", clock=lambda: now[0])
@@ -326,6 +346,6 @@ def test_store_is_safe_for_concurrent_readers_and_writers(tmp_path):
             futures.append(executor.submit(write_many))
             for future in futures:
                 future.result()
-        assert store.get_snapshot().generation == 11
+        assert store.get_snapshot().generation == 10
     finally:
         store.close()

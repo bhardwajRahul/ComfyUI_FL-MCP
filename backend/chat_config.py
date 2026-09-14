@@ -9,6 +9,7 @@ import threading
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.getenv("FL_MCP_DATA_DIR", PROJECT_ROOT / ".fl_mcp"))
@@ -220,6 +221,10 @@ class ChatSettingsStore:
         base_url = str(value.get("base_url") or preset["base_url"]).strip().rstrip("/")
         if preset["type"] == "openai_compatible" and not base_url:
             raise ValueError("An OpenAI-compatible base URL is required.")
+        if provider in {"lmstudio", "ollama"}:
+            parsed_url = urlsplit(base_url)
+            if parsed_url.scheme in {"http", "https"} and parsed_url.netloc and not parsed_url.path:
+                base_url = f"{base_url}/v1"
         temperature = float(value.get("temperature", 0.2))
         if temperature < 0 or temperature > 2:
             raise ValueError("temperature must be between 0 and 2")

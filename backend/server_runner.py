@@ -80,6 +80,7 @@ class ServerRunner:
         self._cleaned_up = False
         self._should_monitor = False
         self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_lock = threading.Lock()
         self.last_error: Optional[str] = None
         
         # Setup logging
@@ -486,9 +487,15 @@ class ServerRunner:
     
     def _start_monitoring(self):
         """Start monitoring thread for auto-restart."""
-        self._should_monitor = True
-        self._monitor_thread = threading.Thread(target=self._monitor_process, daemon=True)
-        self._monitor_thread.start()
+        with self._monitor_lock:
+            if self._monitor_thread is not None and self._monitor_thread.is_alive():
+                return
+            self._should_monitor = True
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_process,
+                daemon=True,
+            )
+            self._monitor_thread.start()
         print("[FL-MCP] Auto-restart monitoring enabled")
     
     def _monitor_process(self):
@@ -554,23 +561,29 @@ class ServerRunner:
         print("[FL-MCP] Waiting for backend to be ready...", end="", flush=True)
         
         while time.time() - start_time < timeout:
+            if self.active_mode == "subprocess" and self.process:
+                return_code = self.process.poll()
+                if return_code is not None:
+                    print(" Failed!")
+                    print(f"[FL-MCP] Process terminated during startup (exit code: {return_code})")
+                    self.last_error = (
+                        f"Backend exited during startup with code {return_code}. "
+                        f"Check {self.backend_dir / 'logs' / 'fl_mcp_server.log'}."
+                    )
+                    return False
+
             if self.is_port_in_use():
                 # Port is open, give it a moment to fully initialize
                 time.sleep(0.5)
+                if (
+                    self.active_mode == "subprocess"
+                    and self.process
+                    and self.process.poll() is not None
+                ):
+                    continue
                 print(" Ready!")
                 return True
-            
-            # Check if process crashed during startup (subprocess mode only)
-            if self.active_mode == "subprocess" and self.process and self.process.poll() is not None:
-                print(" Failed!")
-                return_code = self.process.poll()
-                print(f"[FL-MCP] Process terminated during startup (exit code: {return_code})")
-                self.last_error = (
-                    f"Backend exited during startup with code {return_code}. "
-                    f"Check {self.backend_dir / 'logs' / 'fl_mcp_server.log'}."
-                )
-                return False
-            
+
             time.sleep(0.5)
             print(".", end="", flush=True)
         

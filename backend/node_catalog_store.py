@@ -365,8 +365,37 @@ class NodeCatalogStore:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 state = self._connection.execute(
-                    "SELECT generation FROM catalog_state WHERE singleton = 1"
+                    """
+                    SELECT generation, catalog_hash, observed_catalog_hash, node_count
+                    FROM catalog_state WHERE singleton = 1
+                    """
                 ).fetchone()
+                if (
+                    int(state["generation"]) > 0
+                    and state["catalog_hash"] == catalog_hash
+                    and state["observed_catalog_hash"] == observed_catalog_hash
+                    and int(state["node_count"]) == len(prepared)
+                ):
+                    self._connection.execute(
+                        """
+                        UPDATE catalog_state SET
+                            source = ?, fetched_at = ?, last_refresh_attempt_at = ?,
+                            last_refresh_error = NULL
+                        WHERE singleton = 1
+                        """,
+                        (source, now, now),
+                    )
+                    self._connection.commit()
+                    return CatalogReconciliation(
+                        generation=int(state["generation"]),
+                        catalog_hash=catalog_hash,
+                        observed_catalog_hash=observed_catalog_hash,
+                        node_count=len(prepared),
+                        new_count=0,
+                        changed_count=0,
+                        removed_count=0,
+                        unchanged_count=len(prepared),
+                    )
                 generation = int(state["generation"]) + 1
                 previous = {
                     row["node_type"]: row

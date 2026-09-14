@@ -15,13 +15,36 @@ async function loadAssistantPanel() {
     const classSource = source
         .slice(classStart)
         .replace("export class AssistantPanel", "class AssistantPanel");
-    const context = vm.createContext({});
+    const context = vm.createContext({ Date, setInterval, clearInterval });
     vm.runInContext(
         `${classSource}\nglobalThis.AssistantPanel = AssistantPanel;`,
         context,
     );
     return context.AssistantPanel;
 }
+
+
+test("run phases show elapsed time and clear their timer", async () => {
+    const AssistantPanel = await loadAssistantPanel();
+    const panel = Object.create(AssistantPanel.prototype);
+    panel.runStatusText = { textContent: "" };
+    panel.runStatusIcon = { className: "" };
+    panel.runPhaseTimer = null;
+    panel.runPhaseStartedAt = 0;
+    panel.runPhaseLabel = "";
+    panel.runPhaseIcon = "";
+
+    panel.startRunPhase("Compiling workflow", "pi pi-cog");
+    panel.runPhaseStartedAt = Date.now() - 2_200;
+    panel.renderRunPhase();
+
+    assert.equal(panel.runStatusText.textContent, "Compiling workflow · 2s");
+    assert.match(panel.runStatusIcon.className, /pi pi-cog/);
+    assert.notEqual(panel.runPhaseTimer, null);
+    panel.stopRunPhase();
+    assert.equal(panel.runPhaseTimer, null);
+    assert.equal(panel.runPhaseLabel, "");
+});
 
 
 test("settings accordion opens the requested section and closes its siblings", async () => {

@@ -323,6 +323,10 @@ export class FL_API {
         return workflowIdentityFor(workflow);
     }
 
+    pinCurrentWorkflow() {
+        return this.pinActiveWorkflow(this.getActiveWorkflowIdentity());
+    }
+
     /** Pin the exact ComfyWorkflow object only when its compiled identity still matches. */
     pinActiveWorkflow(expectedIdentity) {
         const workflow = this._getActiveWorkflow();
@@ -3089,16 +3093,7 @@ export class FL_API {
      */
     getLayout(nodeIds = null) {
         try {
-            // Safety check for graph
-            if (!app.graph || !app.graph._nodes) {
-                console.warn("[FL_API] Graph not ready");
-                return { nodes: [], count: 0 };
-            }
-            
-            // Get nodes to process
-            const nodes = nodeIds 
-                ? nodeIds.map(id => this._findNode(id)).filter(n => n !== null)
-                : app.graph._nodes;
+            const nodes = this._layoutNodes(nodeIds);
             
             // Collect layout data
             const layout = nodes.map(node => ({
@@ -3121,6 +3116,66 @@ export class FL_API {
         }
     }
 
+    _layoutNodes(nodeIds = null) {
+        const graphNodes = app.graph?._nodes;
+        if (!Array.isArray(graphNodes)) {
+            throw new Error("The workflow graph is not ready.");
+        }
+        if (nodeIds === null || nodeIds === undefined) {
+            return [...graphNodes];
+        }
+        if (!Array.isArray(nodeIds)) {
+            throw new Error("Layout node IDs must be an array.");
+        }
+
+        const nodesById = new Map();
+        const nodesByTitle = new Map();
+        for (const node of graphNodes) {
+            const idKey = String(node.id);
+            const idMatches = nodesById.get(idKey) || [];
+            idMatches.push(node);
+            nodesById.set(idKey, idMatches);
+            if (typeof node.title === "string") {
+                const titleMatches = nodesByTitle.get(node.title) || [];
+                titleMatches.push(node);
+                nodesByTitle.set(node.title, titleMatches);
+            }
+        }
+
+        const resolved = [];
+        const seen = new Set();
+        for (const query of nodeIds) {
+            const idMatches = nodesById.get(String(query)) || [];
+            const matches = idMatches.length > 0
+                ? idMatches
+                : typeof query === "string"
+                    ? nodesByTitle.get(query) || []
+                    : [];
+            if (matches.length !== 1) {
+                throw new Error(
+                    matches.length === 0
+                        ? `Layout node not found: ${String(query)}`
+                        : `Layout node is ambiguous: ${String(query)}`,
+                );
+            }
+            if (seen.has(matches[0])) {
+                throw new Error(`Layout node is repeated: ${String(query)}`);
+            }
+            seen.add(matches[0]);
+            resolved.push(matches[0]);
+        }
+        return resolved;
+    }
+
+    async _getLayoutEngine() {
+        if (!this.layoutEngine) {
+            const { LayoutEngine } = await import('./layout_engine.js');
+            this.layoutEngine = new LayoutEngine();
+            console.log("[FL_API] LayoutEngine loaded");
+        }
+        return this.layoutEngine;
+    }
+
     /**
      * Modify layout for multiple nodes by setting their rectangles or using auto-layout
      * @param {object} nodeRects - rect objects mapped by nodeId {nodeId: {x, y, width, height}}
@@ -3128,103 +3183,106 @@ export class FL_API {
      * @returns {Array<object>} Array of results with updated rectangles or errors
      */
     async modifyLayout(nodeRects = null, options = {}) {
+        let requestedRects;
+        if (options.auto_layout === true) {
+            const engine = await this._getLayoutEngine();
+            const requestedNodeIds = options.node_ids || null;
+            const nodes = this._layoutNodes(requestedNodeIds);
+            engine.setSpacingMultiplier(options.spacing_multiplier ?? 1.0);
+            requestedRects = engine.calculateLayout(
+                requestedNodeIds === null ? null : nodes.map(node => node.id),
+                options.strategy || "flow_horizontal",
+            );
+        } else if (Array.isArray(nodeRects)) {
+            requestedRects = nodeRects;
+        } else if (nodeRects && typeof nodeRects === "object") {
+            requestedRects = Object.entries(nodeRects).map(([nodeId, rect]) => ({
+                node_id: nodeId,
+                ...rect,
+            }));
+        } else {
+            return [];
+        }
+        if (requestedRects.length === 0) return [];
+
+        const pin = this.pinCurrentWorkflow();
+        const resolvedNodes = this._layoutNodes(
+            requestedRects.map(item => item.node_id),
+        );
+        const prepared = requestedRects.map((item, index) => {
+            const node = resolvedNodes[index];
+            const rect = {
+                x: item.x ?? node.pos[0],
+                y: item.y ?? node.pos[1],
+                width: item.width ?? node.size[0],
+                height: item.height ?? node.size[1],
+            };
+            if (Object.values(rect).some(value => !Number.isFinite(value))) {
+                throw new Error(`Layout rectangle for node ${String(item.node_id)} is invalid.`);
+            }
+            if (rect.width <= 0 || rect.height <= 0) {
+                throw new Error(`Layout size for node ${String(item.node_id)} must be positive.`);
+            }
+            return {
+                node,
+                nodeId: node.id,
+                rect,
+                before: {
+                    x: node.pos[0],
+                    y: node.pos[1],
+                    width: node.size[0],
+                    height: node.size[1],
+                },
+            };
+        });
+
+        const guard = await this.createWorkflowMutationGuard(pin);
+        await this.assertWorkflowMutationGuard(guard);
+        let transaction = this.beginWorkflowChangeTransaction(pin);
         try {
-            // MODE 1: Auto-layout
-            if (options.auto_layout === true) {
-                console.log(`[FL_API] Auto-layout requested with strategy: ${options.strategy || 'flow_horizontal'}`);
-                
-                // Lazy load LayoutEngine
-                if (!this.layoutEngine) {
-                    const { LayoutEngine } = await import('./layout_engine.js');
-                    this.layoutEngine = new LayoutEngine();
-                    console.log("[FL_API] LayoutEngine loaded");
-                }
-
-                // Configure spacing
-                if (options.spacing_multiplier !== undefined && options.spacing_multiplier !== null) {
-                    this.layoutEngine.setSpacingMultiplier(options.spacing_multiplier);
-                } else {
-                    // Reset to default if not specified
-                    this.layoutEngine.setSpacingMultiplier(1.0);
-                }
-
-                // Run layout engine
-                const layout = this.layoutEngine.arrangeNodes(
-                    options.node_ids || null,
-                    options.strategy || "flow_horizontal",
-                    {}
-                );
-
-                // Apply calculated positions using setRect
-                const results = [];
-                for (const item of layout) {
-                    try {
-                        const updatedRect = this.setRect(item.node_id, {
-                            x: item.x,
-                            y: item.y,
-                            width: item.width,
-                            height: item.height
-                        });
-                        results.push({
-                            node_id: item.node_id,
-                            rect: updatedRect,
-                            success: true
-                        });
-                    } catch (error) {
-                        console.error(`[FL_API] Auto-layout: Error setting rect for node ${item.node_id}:`, error);
-                        results.push({
-                            node_id: item.node_id,
-                            success: false,
-                            error: error.message
-                        });
-                    }
-                }
-
-                console.log(`[FL_API] Auto-layout complete: ${results.length} nodes arranged`);
-                return results;
+            for (const item of prepared) {
+                item.node.pos[0] = item.rect.x;
+                item.node.pos[1] = item.rect.y;
+                item.node.size[0] = item.rect.width;
+                item.node.size[1] = item.rect.height;
             }
-
-            // MODE 2: Manual layout (existing behavior)
-            if (!nodeRects || typeof nodeRects !== 'object') {
-                console.log('[FL_API] modifyLayout: No node rects provided');
-                return [];
-            }
-
-            const results = [];
-            let processed = 0;
-            let successful = 0;
-            let failed = 0;
-
-            // Process each node
-            for (const [nodeIdStr, rect] of Object.entries(nodeRects)) {
-                const nodeId = parseInt(nodeIdStr, 10);
-                processed++;
-
-                try {
-                    // Call setRect and collect result
-                    const updatedRect = this.setRect(nodeId, rect);
-                    results.push({
-                        node_id: nodeId,
-                        rect: updatedRect,
-                        success: true
-                    });
-                    successful++;
-                } catch (error) {
-                    console.error(`[FL_API] modifyLayout: Error setting rect for node ${nodeId}:`, error);
-                    results.push({
-                        node_id: nodeId,
-                        success: false,
-                        error: error.message
-                    });
-                    failed++;
+            this.assertActiveWorkflow(pin);
+            for (const item of prepared) {
+                if (
+                    item.node.pos[0] !== item.rect.x
+                    || item.node.pos[1] !== item.rect.y
+                    || item.node.size[0] !== item.rect.width
+                    || item.node.size[1] !== item.rect.height
+                ) {
+                    throw new Error(`Layout verification failed for node ${String(item.nodeId)}.`);
                 }
             }
-
-            console.log(`[FL_API] modifyLayout: Processed ${processed} nodes (${successful} successful, ${failed} failed)`);
+            this._markGraphChanged();
+            await this.acceptWorkflowMutationGuard(guard);
+            this.assertActiveWorkflow(pin);
+            const results = prepared.map(item => ({
+                node_id: item.nodeId,
+                rect: { ...item.rect },
+                success: true,
+            }));
+            this.endWorkflowChangeTransaction(transaction);
+            transaction = null;
             return results;
-            
         } catch (error) {
-            console.error('[FL_API] modifyLayout error:', error);
+            for (const item of prepared) {
+                item.node.pos[0] = item.before.x;
+                item.node.pos[1] = item.before.y;
+                item.node.size[0] = item.before.width;
+                item.node.size[1] = item.before.height;
+            }
+            this._markCanvasDirty();
+            if (transaction) {
+                try {
+                    this.endWorkflowChangeTransaction(transaction);
+                } catch (cleanupError) {
+                    console.warn("[FL_API] Could not close failed layout transaction:", cleanupError);
+                }
+            }
             throw error;
         }
     }

@@ -348,7 +348,9 @@ test("composer can steer an active response and exposes real stop progress", asy
     assert.match(panel, /Steer Ren with this message \(Enter\)/);
     assert.match(panel, /Stopping Ren…/);
     assert.match(panel, /fl-run-status-icon/);
-    assert.match(panel, /this\.setRunStatus\(toolConfig\.runningLabel, toolConfig\.iconClass\)/);
+    assert.match(panel, /this\.startRunPhase\(toolConfig\.runningLabel, toolConfig\.iconClass\)/);
+    assert.match(panel, /formatDuration\(durationMs\)/);
+    assert.match(panel, /this\.runPhaseTimer = globalThis\.setInterval/);
     assert.match(panel, /setRunStatusForActiveTool/);
     assert.match(panel, /this\.stopButton\.disabled = this\.stopping \|\| this\.steering/);
     assert.match(panel, /this\.textarea\.disabled = false/);
@@ -643,4 +645,24 @@ test("Codex subscription setup stays separate from OpenAI API keys", async () =>
     assert.match(panel, /Finish signing in through the Codex terminal window/);
     assert.match(client, /\/api\/chat\/codex\/login/);
     assert.match(client, /\/api\/chat\/codex\/refresh/);
+});
+
+
+test("streaming appends plain text and renders markdown once at completion", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const flush = panel.slice(
+        panel.indexOf("flushAssistantText(message) {"),
+        panel.indexOf("finishActiveTextSegment(message", panel.indexOf("flushAssistantText(message) {")),
+    );
+
+    assert.match(panel, /message\.activeTextNode\.appendData\(message\.pendingText\)/);
+    assert.match(
+        panel,
+        /finishActiveTextSegment[\s\S]*?replaceChildren\(this\.renderChatMarkdown\(message\.activeSource\)\)/,
+    );
+    assert.doesNotMatch(
+        flush,
+        /replaceChildren\(this\.renderChatMarkdown/,
+    );
+    assert.match(panel, /if \(card\.open\) this\.renderToolTechnical\(card, card\.toolStep\)/);
 });

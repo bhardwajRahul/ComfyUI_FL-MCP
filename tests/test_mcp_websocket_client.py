@@ -210,3 +210,33 @@ async def test_embedded_tool_filter_supports_current_fastmcp_api(monkeypatch):
     await mcp_server._restrict_tools_from_environment()
 
     assert fake.removed == ["queue_workflow"]
+
+
+@pytest.mark.asyncio
+async def test_native_turn_controls_advertise_only_the_compact_apply_handle(monkeypatch):
+    class Tool:
+        def __init__(self):
+            self.name = "apply_workflow_graph_patch"
+            self.parameters = {"large": "schema"}
+            self.description = "large apply tool"
+
+    class FakeMcp:
+        def __init__(self, tool):
+            self.tool = tool
+
+        async def get_tools(self):
+            return {self.tool.name: self.tool}
+
+        def remove_tool(self, _name):
+            raise AssertionError("the selected apply tool must remain registered")
+
+    tool = Tool()
+    monkeypatch.setattr(mcp_server, "mcp", FakeMcp(tool))
+    monkeypatch.setenv("FL_MCP_ALLOWED_TOOLS", "apply_workflow_graph_patch")
+    monkeypatch.setenv("FL_MCP_NATIVE_TURN_CONTROLS", "1")
+
+    await mcp_server._restrict_tools_from_environment()
+
+    assert tool.parameters["properties"]["request"]["required"] == ["handle"]
+    assert len(str(tool.parameters)) < 500
+    assert "opaque apply handle" in tool.description
