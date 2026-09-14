@@ -39,6 +39,7 @@ from config import (
 from config import (
     settings as bridge_settings,
 )
+from version import RUNTIME_BUILD_ID
 
 logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).with_name("chat_prompt.md")
@@ -130,6 +131,22 @@ WEB_IMAGE_INTENT_PATTERNS = (
     re.compile(r"\bwhat\b.{0,100}\blooks?\s+like\b", re.IGNORECASE),
 )
 
+CANVAS_IMAGE_INSPECTION_ACTION = re.compile(
+    r"\b(?:analy[sz](?:e|ing)?|inspect(?:ing)?|identify(?:ing)?|describe|"
+    r"compare|examine|review|view|look\s+at|tell\s+me\s+what|show|display|"
+    r"list|what)\b",
+    re.IGNORECASE,
+)
+CANVAS_IMAGE_VISUAL_NOUN = re.compile(
+    r"\b(?:images?|photos?|pictures?|references?|vehicles?|cars?|trucks?|"
+    r"tanks?|them\s+all)\b",
+    re.IGNORECASE,
+)
+CANVAS_IMAGE_STRONG_SCOPE = re.compile(
+    r"\b(?:canvas|canavs|cnavas|canavas|already\s+(?:loaded|open))\b",
+    re.IGNORECASE,
+)
+
 NODE_KNOWLEDGE_INTENT_PATTERNS = (
     re.compile(
         r"\b(?:local|persistent|remembered|learned)\s+(?:node\s+)?"
@@ -140,6 +157,46 @@ NODE_KNOWLEDGE_INTENT_PATTERNS = (
     re.compile(r"\b(?:first|last)[- ]seen\s+generation\b", re.IGNORECASE),
     re.compile(r"\bnode_knowledge_search\b", re.IGNORECASE),
 )
+
+CORE_CHAT_TOOLS = {
+    "workflow_overview",
+    "workflow_get_current_json",
+    "find_node",
+    "get_current_node_selection",
+    "get_node_values",
+    "view_node_mask",
+    "edit_node_mask",
+    "confirm_mask_review",
+    "get_node_slots",
+    "create_nodes",
+    "remove_nodes",
+    "set_node_values",
+    "connect_nodes_batch",
+    "get_layout",
+    "modify_layout",
+    "take_screenshot",
+    "queue_workflow",
+    "wait",
+    "get_execution_history",
+    "view_output_image",
+    "view_chat_image",
+    "place_chat_image_in_node",
+    "get_queue_status",
+    "node_library_search",
+    "node_library_get_details",
+    "node_library_status",
+    "node_knowledge_search",
+    "compile_workflow_spec",
+    "resolve_workflow_spec",
+    "plan_workflow",
+    "apply_workflow_plan",
+    "compile_workflow_refinement_spec",
+    "apply_workflow_graph_patch",
+    "registry_search_packages",
+    "registry_get_package",
+    "mcp_capability_audit",
+}
+
 
 INSPECTION_CHAT_TOOLS = {
     "query_workflow",
@@ -234,6 +291,911 @@ REFINEMENT_MASK_TOOLS = {
     "confirm_mask_review",
 }
 
+MASK_LANE_STATE_KEY = "maskLane"
+PROMPT_VALUE_LANE_STATE_KEY = "promptValueLane"
+MASK_LANE_HISTORY_LIMIT = 16
+PROMPT_VALUE_CORRECTION_TURN_LIMIT = 2
+PROMPT_VALUE_TOOLS = {"update_connected_prompt"}
+PROMPT_REFERENCE_TOOLS = {"view_prompt_reference_image"}
+CANVAS_IMAGE_INSPECTION_TOOLS = {"view_canvas_images"}
+CANVAS_IMAGE_READ_ONLY_TOOLS = {
+    "view_canvas_images",
+    "workflow_get_current_json",
+    "workflow_overview",
+    "find_node",
+    "get_node_slots",
+}
+PROMPT_CONTEXT_INSPECTION_TOOLS = {
+    "view_canvas_images",
+    "view_node_mask",
+    "view_prompt_reference_image",
+}
+PROMPT_WORD_PATTERN = r"(?:prompts?)"
+# Enumerating every possible typo of "prompt" doesn't scale; instead every
+# alphabetic token close to "prompt"/"prompts" by edit distance is folded to
+# the canonical spelling once, in _canonicalize_prompt_typos below, so every
+# PROMPT_WORD_PATTERN match downstream sees only the canonical form.
+_PROMPT_TYPO_TOKEN_RE = re.compile(r"[a-z']+")
+_PROMPT_TYPO_CANONICAL_TARGETS = ("prompt", "prompts")
+_PROMPT_TYPO_MAX_DISTANCE = 2
+_PROMPT_TYPO_TOKEN_LENGTH_RANGE = (5, 8)
+# "pormot(s)" sits just outside edit-distance 2 of "prompt(s)" (distance 3-4)
+# but has existing test coverage from before fuzzy matching existed; kept as
+# an exact allowlist rather than loosening the distance threshold globally,
+# since a threshold of 3 pulls in common real words (print, point, group,
+# process, product, project, permit, ...) confirmed against a full
+# dictionary scan.
+_PROMPT_LEGACY_TYPO_TOKENS = frozenset({"pormot", "pormots"})
+# Real English words within edit-distance 2 of "prompt"/"prompts" (found via
+# an exhaustive scan of /usr/share/dict/words) that fuzzy matching must never
+# fold, since they mean something unrelated to "the prompt" here.
+_PROMPT_FUZZY_MATCH_DENYLIST = frozenset({
+    "profit", "promote", "promoted", "promotes", "promoting", "promoter",
+    "promoters", "promptly", "props", "primp", "primps", "primped",
+    "primping", "tromp", "tromps", "tromped", "tromping", "trompe",
+    "dompt", "droopt", "dropt", "pompa", "preomit", "promic", "pronpl",
+    "propus", "rompu", "rompy",
+})
+
+
+def _levenshtein_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous_row = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current_row = [i]
+        for j, right_char in enumerate(right, start=1):
+            current_row.append(min(
+                previous_row[j] + 1,
+                current_row[j - 1] + 1,
+                previous_row[j - 1] + (left_char != right_char),
+            ))
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def _canonicalize_prompt_typos(text: str) -> str:
+    """Fold any close misspelling of "prompt"/"prompts" to its canonical form."""
+
+    min_length, max_length = _PROMPT_TYPO_TOKEN_LENGTH_RANGE
+
+    def replace(match: "re.Match[str]") -> str:
+        token = match.group(0)
+        if token in _PROMPT_TYPO_CANONICAL_TARGETS:
+            return token
+        if token in _PROMPT_LEGACY_TYPO_TOKENS:
+            return "prompt"
+        if token in _PROMPT_FUZZY_MATCH_DENYLIST:
+            return token
+        if not (min_length <= len(token) <= max_length):
+            return token
+        if any(
+            _levenshtein_distance(token, target) <= _PROMPT_TYPO_MAX_DISTANCE
+            for target in _PROMPT_TYPO_CANONICAL_TARGETS
+        ):
+            return "prompt"
+        return token
+
+    return _PROMPT_TYPO_TOKEN_RE.sub(replace, text)
+
+
+PROMPT_VALUE_ACTION_PATTERN = (
+    r"(?:add(?:ed|ing)?|append(?:ed|ing)?|remov(?:e|ed|ing)|"
+    r"adjust(?:ed|ing)?|adjsut(?:ed|ing)?|djust(?:ed|ing)?|"
+    r"chang(?:e|ed|ing)|edit(?:ed|ing)?|modif(?:y|ied|ying)|"
+    r"rewrit(?:e|ten|ing)|revis(?:e|ed|ing)|updat(?:e|ed|ing)|"
+    r"fix(?:ed|ing)?|correct(?:ed|ing)?|tweak(?:ed|ing)?|"
+    r"refin(?:e|ed|ing)|improv(?:e|ed|ing)|reword(?:ed|ing)?|"
+    r"adapt(?:ed|ing)?|set(?:ting)?|replac(?:e|ed|ing)|"
+    r"highlight(?:ed|ing)?|emphasi[sz](?:e|ed|ing)|boost(?:ed|ing)?|"
+    r"intensif(?:y|ied|ying)|increas(?:e|ed|ing)|decreas(?:e|ed|ing)|"
+    r"enhanc(?:e|ed|ing)|amplif(?:y|ied|ying)|strengthen(?:ed|ing)?|"
+    r"much\s+more|much\s+less|(?:too|to)\s+(?:much|many|little|few)|"
+    r"way\s+too\s+(?:much|many|little|few))"
+)
+PROMPT_VALUE_NEGATABLE_ACTION_PATTERN = (
+    rf"(?:{PROMPT_VALUE_ACTION_PATTERN}|apply(?:ing)?|use|using)"
+)
+
+
+def _visible_user_text(message: str) -> str:
+    return _canonicalize_prompt_typos(str(message or "").split(
+        "\n\nThe user attached ComfyUI input image(s)",
+        1,
+    )[0].casefold().replace("’", "'").replace("‘", "'"))
+
+
+def _message_has_attachment_context(message: str) -> bool:
+    return "\n\nThe user attached ComfyUI input image(s)" in str(message or "")
+
+
+def canvas_image_inspection_requested(message: str) -> bool:
+    """Return whether this turn explicitly asks to inspect images already on the canvas."""
+
+    visible = _visible_user_text(message)
+    if re.search(r"\b(?:view_canvas_images|canvas\s+image\s+viewer)\b", visible):
+        return True
+    action = CANVAS_IMAGE_INSPECTION_ACTION.search(visible)
+    if not action or re.search(
+        r"\b(?:do\s+not|don't|dont|without)\b.{0,30}"
+        r"\b(?:analy[sz]e|inspect|identify|describe|compare|examine|review|view)\b",
+        visible,
+    ):
+        return False
+    visual = CANVAS_IMAGE_VISUAL_NOUN.search(visible)
+    if not visual:
+        return False
+    if CANVAS_IMAGE_STRONG_SCOPE.search(visible) or re.search(r"\bimage_[1-9]\d*\b", visible):
+        return True
+    broad_visual_set = re.search(
+        r"\b(?:all|every)\b.{0,50}\b(?:images?|photos?|pictures?|references?|"
+        r"vehicles?|cars?|trucks?|tanks?)\b"
+        r"|\b(?:images?|photos?|pictures?|references?|vehicles?|cars?|trucks?|"
+        r"tanks?)\b.{0,50}\b(?:all|every)\b",
+        visible,
+    )
+    external_context = re.search(
+        r"\b(?:attached|attachment|output|result|generated|rendered|history|web|"
+        r"internet|online)\b",
+        visible,
+    )
+    return bool(broad_visual_set and not external_context)
+
+
+def canvas_mutation_explicitly_denied(message: str) -> bool:
+    """Recognize an explicit read-only constraint on a canvas-inspection turn."""
+
+    visible = _visible_user_text(message)
+    return bool(
+        re.search(
+            r"\b(?:do\s+not|don't|dont|without)\b.{0,40}"
+            r"\b(?:modify|modifying|change|changing|edit|editing|mutate|mutating)\b"
+            r".{0,30}\b(?:the\s+)?(?:canvas|workflow|graph)\b",
+            visible,
+        )
+        or re.search(
+            r"\b(?:read[ -]?only|inspection only|no canvas changes?)\b",
+            visible,
+        )
+    )
+
+
+_TOPOLOGY_MUTATION_VERB_PATTERN = (
+    r"(?:add|append|create|build|insert|remove|delete|replace|connect|"
+    r"disconnect|rewire)"
+)
+_TOPOLOGY_GRAPH_NOUN_PATTERN = (
+    r"(?:nodes?|edges?|links?|sockets?|inputs?|outputs?|branch|chain|graph|pipeline)"
+)
+# A graph noun immediately after one of these prepositions names an existing
+# node as a location/target ("add a prompt to this node"), not something being
+# constructed ("add a node"). Only a bare/direct-object graph noun counts as
+# topology construction.
+_TOPOLOGY_NOUN_AS_TARGET_PREFIX_PATTERN = (
+    r"(?:to|on|onto|into|for|at|from|of|in)\s+(?:the|this|that|a|an)?\s*$"
+)
+
+
+def explicit_topology_change_requested(message: str) -> bool:
+    """Keep explicit node/edge construction in the GraphPatch lane."""
+
+    visible = _visible_user_text(message)
+    for verb_match in re.finditer(rf"\b{_TOPOLOGY_MUTATION_VERB_PATTERN}\b", visible):
+        window = visible[verb_match.end():verb_match.end() + 100]
+        for noun_match in re.finditer(rf"\b{_TOPOLOGY_GRAPH_NOUN_PATTERN}\b", window):
+            preceding = window[:noun_match.start()]
+            if not re.search(_TOPOLOGY_NOUN_AS_TARGET_PREFIX_PATTERN, preceding):
+                return True
+    return bool(
+        re.search(
+            rf"\b{_TOPOLOGY_GRAPH_NOUN_PATTERN}\b.{{0,100}}\b(?:connect|disconnect|rewire)\b",
+            visible,
+        )
+    )
+
+
+# "find/search for new masking nodes" names the same word ("masking") the
+# mask-edit detector below matches on, but it asks to discover node packages,
+# not to edit a mask already on the canvas - it must not be swallowed into
+# the narrow mask-editing tool lane, which has no registry/discovery tools.
+# Verbs deliberately accept their progressive/past forms ("I'm searching
+# for...", "I was looking for...") - matching only the bare stem silently
+# missed exactly the phrasings real users type.
+_NODE_DISCOVERY_INTENT_PATTERN = re.compile(
+    r"\b(?:find(?:ing)?|search(?:ing|ed)?|look(?:ing|ed)?\s+for|browse|browsing|"
+    r"explor(?:e|ing)|hunt(?:ing)?|discover(?:ing)?|recommend|suggest)\b"
+    r".{0,60}\b(?:new\s+)?(?:nodes?|node\s+packs?|packs?|packages?|"
+    r"extensions?|plugins?|registry|registries)\b",
+    re.IGNORECASE,
+)
+
+
+def node_discovery_requested(message: str) -> bool:
+    """Recognize a request to find/discover new node packages, not edit one."""
+
+    return bool(_NODE_DISCOVERY_INTENT_PATTERN.search(_visible_user_text(message)))
+
+
+def mask_edit_requested(message: str) -> bool:
+    """Recognize visual mask work without requiring canvas or node vocabulary."""
+
+    if explicit_topology_change_requested(message):
+        return False
+    if node_discovery_requested(message):
+        return False
+    visible = _visible_user_text(message)
+    return bool(
+        re.search(
+            r"\b(?:mask(?:ed|ing|s)?|inpaint(?:ed|ing)?|paint(?:ed|ing)?|"
+            r"erase|erasing|face[ -]?swap)\b",
+            visible,
+        )
+        or re.search(
+            r"\b(?:draw|make|change|adjust|redo|refine)\b.{0,60}\bmask\b",
+            visible,
+        )
+    )
+
+
+def prompt_value_edit_requested(message: str) -> bool:
+    """Recognize prompt-text changes without treating them as graph topology."""
+
+    if explicit_topology_change_requested(message):
+        return False
+    visible = _visible_user_text(message)
+    preserved_prompt_delta = re.search(
+        rf"\b(?:keep|preserve|retain|leave)\b.{{0,50}}"
+        rf"\b{PROMPT_WORD_PATTERN}\b.{{0,50}}"
+        rf"\b(?:and|but|except)\b.{{0,20}}"
+        rf"(?P<delta>(?!(?:do\s+not|don'?t|dont|never)\b)"
+        rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b\s+(?!nothing\b)\S+)",
+        visible,
+    )
+    negated_replace_delta = re.search(
+        rf"\b(?:do\s+not|don'?t|dont|never)\s+(?:replace|rewrite)\b"
+        rf".{{0,30}}\b{PROMPT_WORD_PATTERN}\b.{{0,20}}[;,.]?\s*"
+        rf"(?P<delta>(?!(?:do\s+not|don'?t|dont|never)\b)"
+        rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b\s+(?!nothing\b)\S+)",
+        visible,
+    )
+    preservation_noop = re.search(
+        rf"\b(?:keep|preserve|retain|leave)\b.{{0,50}}"
+        rf"\b{PROMPT_WORD_PATTERN}\b.{{0,50}}"
+        rf"\b(?:and|but|except)\b.{{0,20}}"
+        rf"(?:do\s+not|don'?t|dont|never)\s+"
+        rf"{PROMPT_VALUE_ACTION_PATTERN}\b",
+        visible,
+    ) or re.search(
+        rf"\b(?:keep|preserve|retain|leave)\b.{{0,50}}"
+        rf"\b{PROMPT_WORD_PATTERN}\b.{{0,50}}"
+        rf"\b(?:and|but|except)\b.{{0,20}}"
+        rf"{PROMPT_VALUE_ACTION_PATTERN}\s+(?:nothing|anything)\b",
+        visible,
+    )
+    negated_replace_noop = re.search(
+        rf"\b(?:do\s+not|don'?t|dont|never)\s+(?:replace|rewrite)\b"
+        rf".{{0,30}}\b{PROMPT_WORD_PATTERN}\b.{{0,20}}[;,.]?\s*"
+        rf"(?:do\s+not|don'?t|dont|never)\s+"
+        rf"{PROMPT_VALUE_ACTION_PATTERN}\b",
+        visible,
+    )
+    if (
+        preserved_prompt_delta or negated_replace_delta
+    ) and not (preservation_noop or negated_replace_noop):
+        return True
+    if re.search(r"\bnot\s+now\b", visible) and re.search(
+        rf"\b{PROMPT_WORD_PATTERN}\b", visible
+    ):
+        return False
+    if re.search(
+        rf"\b{PROMPT_WORD_PATTERN}\b.{{0,30}}"
+        r"\b(?:stays?|remains?)\b.{{0,12}}\b(?:the\s+same|unchanged)\b",
+        visible,
+    ):
+        return False
+    action_matches = list(
+        re.finditer(rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b", visible)
+    )
+    prompt_matches = list(re.finditer(rf"\b{PROMPT_WORD_PATTERN}\b", visible))
+    if not action_matches or not prompt_matches:
+        return False
+
+    negation = re.compile(
+        r"\b(?:do\s+not|don'?t|dont|never|without|refrain\s+from|"
+        r"hold\s+off\s+on|not\s+now)\b"
+    )
+    clause_boundary = re.compile(
+        rf"[,;.!?]|\b(?:but|except|instead|then|while|whereas)\b|"
+        rf"\band\b(?=\s+(?:(?:do\s+not|don'?t|dont|never)\s+)?"
+        rf"(?:{PROMPT_VALUE_ACTION_PATTERN}|show|give|display|tell|provide|print)\b)"
+    )
+    clause_boundaries = list(clause_boundary.finditer(visible))
+    for action_match in action_matches:
+        clause_start = 0
+        clause_end = len(visible)
+        for boundary in clause_boundaries:
+            if boundary.end() <= action_match.start():
+                clause_start = boundary.end()
+                continue
+            if boundary.start() >= action_match.end():
+                clause_end = boundary.start()
+                break
+        candidates = [
+            prompt_match
+            for prompt_match in prompt_matches
+            if clause_start <= prompt_match.start() < clause_end
+            and abs(prompt_match.start() - action_match.end()) <= 100
+        ]
+        if not candidates:
+            continue
+        prompt_match = min(
+            candidates,
+            key=lambda candidate: abs(candidate.start() - action_match.end()),
+        )
+        span_start = min(action_match.start(), prompt_match.start())
+        span_end = max(action_match.end(), prompt_match.end())
+        clause_prefix = visible[clause_start:action_match.start()]
+        immediate_prefix = visible[max(clause_start, action_match.start() - 20):action_match.start()]
+        if negation.search(clause_prefix):
+            continue
+        if re.search(
+            r"\b(?:do\s+not|don'?t|dont|never)\s*$",
+            immediate_prefix.rstrip(),
+        ):
+            continue
+        between = visible[span_start:span_end]
+        if re.search(
+            rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b.{{0,60}}"
+            rf"\b(?:mask|image(?:[ _-]?\d+)?|photo|picture|canvas)\b"
+            r".{0,60}\b(?:and|then)\b.{0,20}"
+            r"\b(?:show|give|display|tell|provide|print)\b.{0,40}"
+            rf"\b{PROMPT_WORD_PATTERN}\b",
+            between,
+        ):
+            continue
+        if re.search(
+            rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b.{{0,60}}"
+            rf"\b(?:mask|image(?:[ _-]?\d+)?|photo|picture|canvas)\b"
+            r".{0,60}\b(?:using|according\s+to|based\s+on|following|"
+            r"guided\s+by|from)\b.{0,30}"
+            rf"\b{PROMPT_WORD_PATTERN}\b",
+            between,
+        ):
+            continue
+        return True
+    return False
+
+
+def prompt_value_edit_denied(message: str) -> bool:
+    """Recognize an explicit request to keep prompt text unchanged."""
+
+    visible = _visible_user_text(message)
+    return bool(
+        re.search(
+            rf"\b(?:do\s+not|don'?t|dont|never|without|refrain\s+from|"
+            rf"hold\s+off\s+on)\b.{{0,40}}"
+            rf"\b{PROMPT_VALUE_NEGATABLE_ACTION_PATTERN}\b.{{0,40}}"
+            rf"\b{PROMPT_WORD_PATTERN}\b",
+            visible,
+        )
+        or re.search(
+            rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b.{{0,80}}"
+            rf"\b(?:mask|image(?:[ _-]?\d+)?|photo|picture|canvas)\b"
+            r".{0,80}\b(?:leave|keep)\b.{{0,40}}"
+            rf"\b{PROMPT_WORD_PATTERN}\b.{{0,30}}"
+            r"\b(?:alone|unchanged|as[ -]?is)\b",
+            visible,
+        )
+        or re.search(
+            rf"\b(?:leave|keep)\b.{{0,40}}\b{PROMPT_WORD_PATTERN}\b"
+            r"(?:.{0,30}\b(?:alone|unchanged|as[ -]?is)\b)?",
+            visible,
+        )
+        or re.search(
+            rf"\b(?:preserve|retain)\b.{{0,40}}\b{PROMPT_WORD_PATTERN}\b",
+            visible,
+        )
+        or re.search(
+            rf"\b(?:do\s+not|don'?t|dont|never)\s+touch\b.{{0,40}}"
+            rf"\b{PROMPT_WORD_PATTERN}\b",
+            visible,
+        )
+        or re.search(
+            rf"\bno\b.{{0,20}}\b{PROMPT_WORD_PATTERN}\b.{{0,20}}"
+            r"\b(?:changes?|edits?|updates?)\b",
+            visible,
+        )
+        or re.search(
+            rf"\b{PROMPT_WORD_PATTERN}\b.{{0,30}}"
+            r"\b(?:stays?|remains?)\b(?:.{0,12}\b(?:the\s+same|unchanged)\b)?",
+            visible,
+        )
+        or re.search(
+            rf"\b{PROMPT_WORD_PATTERN}\b.{{0,40}}"
+            r"\b(?:alone|unchanged|as[ -]?is)\b",
+            visible,
+        )
+        or re.search(
+            rf"\b{PROMPT_WORD_PATTERN}\b.{{0,80}}"
+            r"\b(?:don'?t|dont|do\s+not|never)\b.{{0,20}}"
+            r"\b(?:add|apply|change|edit|update|use)\b"
+            r"(?:\s+(?:it|that|this))?",
+            visible,
+        )
+        or re.search(
+            rf"\b{PROMPT_WORD_PATTERN}\b.{{0,80}}"
+            r"\b(?:don'?t|dont|do\s+not|never)\s+"
+            r"(?:add|apply|change|edit|update|use)\s+(?:it|that|this)\b",
+            visible,
+        )
+        or re.search(
+            rf"\b(?:show|give|display|tell|provide|print)\b.{{0,60}}"
+            rf"\b{PROMPT_WORD_PATTERN}\b",
+            visible,
+        )
+        is not None
+    )
+
+
+def _prompt_value_tool_candidate(message: str) -> bool:
+    """Widen the default toolset with update_connected_prompt for a message
+    that plausibly wants a prompt edit but isn't confident enough for the
+    narrow prompt_value_edit_requested lane (e.g. "make it more detailed" -
+    no recognized action verb - or an unenumerated typo of a descriptive
+    word, neither of which a closed verb list can ever fully enumerate).
+
+    This only ever adds to the broad CORE_CHAT_TOOLS-based default set; it
+    never narrows or replaces it, so a false positive here costs nothing -
+    the tool sits alongside the ~35 other default tools and chat_prompt.md
+    governs whether Ren actually calls it. The alternative (growing
+    PROMPT_VALUE_ACTION_PATTERN to catch every possible edit verb) is an
+    open-set problem that keeps recurring; the negative signals reused here
+    (negation, preservation, reference-only use, read-only verbs) are a
+    closed, already-tested set, so gating on those is the safer lever.
+    """
+
+    if explicit_topology_change_requested(message):
+        return False
+    visible = _visible_user_text(message)
+    if not re.search(rf"\b{PROMPT_WORD_PATTERN}\b", visible):
+        return False
+    if prompt_value_edit_denied(message):
+        return False
+    # The prompt can also be named as reference material for editing
+    # something else ("edit image_1 using the prompt") rather than as the
+    # edit target itself. prompt_value_edit_denied doesn't cover this case -
+    # it's only handled inside prompt_value_edit_requested's clause-scoped
+    # check - so it needs its own guard here too.
+    if re.search(
+        rf"\b(?:mask|image(?:[ _-]?\d+)?|photo|picture|canvas)\b"
+        r".{0,60}\b(?:using|according\s+to|based\s+on|following|"
+        r"guided\s+by|from)\b.{0,30}"
+        rf"\b{PROMPT_WORD_PATTERN}\b",
+        visible,
+    ):
+        return False
+    return True
+
+
+def prompt_reference_image_requested(message: str) -> bool:
+    """Recognize a prompt edit whose requested identity is carried by image2."""
+
+    visible = _visible_user_text(message)
+    return bool(
+        re.search(r"\bimage[ _-]?2\b", visible)
+        or re.search(r"\b(?:new|character|identity)\b.{0,80}\breference(?:d)? image\b", visible)
+        or re.search(r"\breference(?:d)? (?:character|image)\b", visible)
+    )
+
+
+def prompt_draft_continuation_requested(message: str) -> bool:
+    """Recognize a deictic request to apply the immediately preceding draft."""
+
+    if explicit_topology_change_requested(message):
+        return False
+    visible = " ".join(_visible_user_text(message).split())
+    if re.search(
+        r"\b(?:do\s+not|don'?t|dont|never|without|refrain\s+from|"
+        r"hold\s+off\s+on|not\s+now)\b.{0,40}"
+        r"\b(?:add(?:ing)?|apply(?:ing)?|set(?:ting)?|use|using)\b",
+        visible,
+    ):
+        return False
+    return bool(
+        re.search(
+            rf"\b(?:add|apply|set|use)\b.{{0,40}}"
+            rf"\b(?:the|this|that)\s+{PROMPT_WORD_PATTERN}\b"
+            r"(?:\s+(?:now|please|pls|go ahead))?\s*[.!?]*$",
+            visible,
+        )
+    )
+
+
+def mask_lane_continuation_requested(message: str) -> bool:
+    """Recognize bounded replies that continue, rather than replace, mask work."""
+
+    if _message_has_attachment_context(message) and not _visible_user_text(message).strip():
+        return True
+    visible = " ".join(_visible_user_text(message).split())
+    if not visible:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:again|retry|continue|attached|attachment|go ahead|do it|"
+            r"yourself|fix it|looks? good|cool|yes|yep|nope)\b",
+            visible,
+        )
+        or re.search(
+            r"\b(?:original|source|reference) image\b.{0,50}"
+            r"\b(?:missing|not there|wrong|attached)\b",
+            visible,
+        )
+    )
+
+
+def prompt_value_retry_requested(message: str) -> bool:
+    """Recognize a terse retry that may reuse the prior prompt-reference lane."""
+
+    visible = " ".join(_visible_user_text(message).split()).strip(" .!?")
+    return bool(
+        re.fullmatch(
+            r"(?:ok\s+|please\s+|pls\s+)?(?:retry|try again|continue|go ahead|"
+            r"do it again|do it)",
+            visible,
+        )
+    )
+
+
+def prompt_value_correction_requested(message: str) -> bool:
+    """Recognize a bounded prompt correction without borrowing mask keywords."""
+
+    if mask_edit_requested(message):
+        return False
+    visible = " ".join(_visible_user_text(message).split())
+    if not visible:
+        return False
+    prompt_word = rf"\b{PROMPT_WORD_PATTERN}\b"
+    if re.search(prompt_word, visible) and re.search(
+        r"\b(?:not|wrong|incorrect|unchanged|missing|failed|didn'?t|doesn'?t|"
+        r"isn'?t|wasn'?t)\b",
+        visible,
+    ):
+        return True
+    if re.search(
+        r"^(?:it|this|that)\b.{0,180}\b(?:focus(?:ed)?|center(?:ed|d)?|"
+        r"centre(?:d)?|centerd|mainly|exclusively|instead|preserv(?:e|ed|ing))\b",
+        visible,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:focus(?:ed)?|center(?:ed|d)?|centre(?:d)?|centerd|mainly|"
+            r"exclusively|instead)\b",
+            visible,
+        )
+        or re.search(
+            r"\b(?:no|not|without|exclude|excluding|avoid)\b.{1,100}"
+            r"\b(?:anything|anyone|people|person|woman|women|man|men|girl|boy|"
+            r"subject|character|background)\b",
+            visible,
+        )
+    )
+
+
+def _assistant_prompt_lane_state(item: dict[str, Any]) -> dict[str, bool] | None:
+    """Return an active or successfully completed prompt lane, skipping inactive noise."""
+
+    metadata = item.get("metadata") or {}
+    stored = metadata.get(PROMPT_VALUE_LANE_STATE_KEY)
+    if isinstance(stored, dict) and stored.get("active") is True:
+        return {
+            "active": True,
+            "referenceImage": bool(stored.get("referenceImage")),
+            "combinedMask": False,
+        }
+
+    combined_mask_lane = metadata.get(MASK_LANE_STATE_KEY)
+    if (
+        isinstance(combined_mask_lane, dict)
+        and combined_mask_lane.get("active") is True
+        and combined_mask_lane.get("promptValueEdit") is True
+    ):
+        return {
+            "active": True,
+            "referenceImage": bool(combined_mask_lane.get("promptReferenceImage")),
+            "combinedMask": True,
+        }
+
+    successful_steps = [
+        step
+        for step in metadata.get("toolSteps") or []
+        if isinstance(step, dict)
+        and step.get("status") in {"done", "success", "succeeded", "completed"}
+    ]
+    if not any(step.get("name") == "update_connected_prompt" for step in successful_steps):
+        return None
+    return {
+        "active": True,
+        "referenceImage": bool(
+            isinstance(stored, dict) and stored.get("referenceImage")
+        )
+        or any(
+            step.get("name") == "view_prompt_reference_image"
+            for step in successful_steps
+        ),
+        "combinedMask": False,
+    }
+
+
+def _assistant_completed_prompt_context_inspection(item: dict[str, Any]) -> bool:
+    """Allow one bounded read-only inspection between a prompt edit and correction."""
+
+    metadata = item.get("metadata") or {}
+    successful_names = {
+        str(step.get("name") or "")
+        for step in metadata.get("toolSteps") or []
+        if isinstance(step, dict)
+        and step.get("status") in {"done", "success", "succeeded", "completed"}
+    }
+    return bool(successful_names) and successful_names <= PROMPT_CONTEXT_INSPECTION_TOOLS
+
+
+def _immediate_reference_prompt_draft_handoff(
+    messages: list[dict[str, Any]],
+    latest_user_message: str,
+) -> bool:
+    """Bind a deictic apply request to one immediately preceding image draft."""
+
+    if not prompt_draft_continuation_requested(latest_user_message):
+        return False
+    prior = list(messages)
+    if (
+        prior
+        and prior[-1].get("role") == "user"
+        and message_content_for_model(prior[-1]) == latest_user_message
+    ):
+        prior.pop()
+    if len(prior) < 2:
+        return False
+    assistant_item = prior[-1]
+    user_item = prior[-2]
+    if assistant_item.get("role") != "assistant" or user_item.get("role") != "user":
+        return False
+    if str(assistant_item.get("status") or "complete") != "complete":
+        return False
+    assistant_content = message_content_for_model(assistant_item).strip()
+    if not assistant_content or not re.search(
+        rf"\b(?:{PROMPT_WORD_PATTERN}|draft|refin(?:e|ed))\b",
+        _visible_user_text(assistant_content),
+    ):
+        return False
+    if re.search(
+        r"\b(?:can(?:not|'t)|could(?:not|n't)|unable|failed|failure|"
+        r"did(?: not|n't)|was(?: not|n't) able)\b.{0,80}"
+        rf"\b(?:{PROMPT_WORD_PATTERN}|draft|refin(?:e|ed))\b",
+        _visible_user_text(assistant_content),
+    ):
+        return False
+    prior_user_content = message_content_for_model(user_item)
+    if not prompt_reference_image_requested(prior_user_content):
+        return False
+    if re.search(
+        r"\b(?:do\s+not|don'?t|dont|never|without)\b.{0,50}"
+        r"\b(?:use|using|from|reference|image[ _-]?2)\b",
+        _visible_user_text(prior_user_content),
+    ):
+        return False
+    if not re.search(
+        rf"\b(?:{PROMPT_WORD_PATTERN}|draft|refin(?:e|ed))\b",
+        _visible_user_text(prior_user_content),
+    ):
+        return False
+
+    inspection_steps = [
+        step
+        for step in (assistant_item.get("metadata") or {}).get("toolSteps") or []
+        if isinstance(step, dict)
+    ]
+    if not inspection_steps or any(
+        step.get("status") not in {"done", "success", "succeeded", "completed"}
+        or tool_result_is_error(step.get("result"))
+        for step in inspection_steps
+    ):
+        return False
+    inspection_names = {str(step.get("name") or "") for step in inspection_steps}
+    return bool(inspection_names) and inspection_names <= {
+        "view_chat_image",
+        "view_prompt_reference_image",
+    }
+
+
+def _new_mask_lane_state(message: str) -> dict[str, bool]:
+    attachment_available = _message_has_attachment_context(message)
+    return {
+        "active": True,
+        "promptValueEdit": prompt_value_edit_requested(message),
+        "promptReferenceImage": prompt_reference_image_requested(message),
+        "attachmentAvailable": attachment_available,
+    }
+
+
+def _inactive_mask_lane_state() -> dict[str, bool]:
+    return {
+        "active": False,
+        "promptValueEdit": False,
+        "promptReferenceImage": False,
+        "attachmentAvailable": False,
+    }
+
+
+def derive_mask_lane_state(
+    messages: list[dict[str, Any]],
+    latest_user_message: str,
+) -> dict[str, bool]:
+    """Derive one small persisted mask lane across terse follow-up turns."""
+
+    if mask_edit_requested(latest_user_message):
+        return _new_mask_lane_state(latest_user_message)
+    if not mask_lane_continuation_requested(latest_user_message):
+        return _inactive_mask_lane_state()
+
+    inherited: dict[str, bool] | None = None
+    history = messages[-MASK_LANE_HISTORY_LIMIT:]
+    for index in range(len(history) - 1, -1, -1):
+        item = history[index]
+        if item.get("role") == "assistant":
+            stored = (item.get("metadata") or {}).get(MASK_LANE_STATE_KEY)
+            if isinstance(stored, dict):
+                if stored.get("active") is True:
+                    inherited = {
+                        "active": True,
+                        "promptValueEdit": bool(stored.get("promptValueEdit")),
+                        "promptReferenceImage": bool(stored.get("promptReferenceImage")),
+                        "attachmentAvailable": bool(stored.get("attachmentAvailable")),
+                    }
+                    # A newly fixed bounded typo must also repair the immediately
+                    # following retry. Older assistant metadata was derived by the
+                    # previous parser and may have omitted the prompt tool even
+                    # though the preceding combined request explicitly asked for
+                    # it. Only upgrade that one bit from the adjacent user request;
+                    # never infer it for a genuine mask-only reference task.
+                    if not inherited["promptValueEdit"]:
+                        for prior in reversed(history[:index]):
+                            if prior.get("role") == "assistant":
+                                break
+                            if prior.get("role") != "user":
+                                continue
+                            prior_content = message_content_for_model(prior)
+                            if (
+                                mask_edit_requested(prior_content)
+                                and prompt_value_edit_requested(prior_content)
+                            ):
+                                inherited["promptValueEdit"] = True
+                            break
+                break
+            continue
+        if item.get("role") != "user":
+            continue
+        content = message_content_for_model(item)
+        if content == latest_user_message:
+            continue
+        if mask_edit_requested(content):
+            inherited = _new_mask_lane_state(content)
+            break
+        if not mask_lane_continuation_requested(content):
+            break
+
+    if inherited is None:
+        return _inactive_mask_lane_state()
+    if prompt_value_edit_denied(latest_user_message):
+        inherited["promptValueEdit"] = False
+    if _message_has_attachment_context(latest_user_message):
+        inherited["attachmentAvailable"] = True
+    return inherited
+
+
+def _mask_lane_tools(message: str, state: dict[str, bool]) -> set[str]:
+    selected = set(REFINEMENT_MASK_TOOLS)
+    if state.get("promptValueEdit"):
+        selected.update(PROMPT_VALUE_TOOLS)
+    if state.get("promptReferenceImage"):
+        selected.update(PROMPT_REFERENCE_TOOLS)
+    if state.get("attachmentAvailable"):
+        selected.update({"view_chat_image", "place_chat_image_in_node"})
+    if canvas_image_inspection_requested(message):
+        selected.update(CANVAS_IMAGE_INSPECTION_TOOLS)
+    selected.update(_graph_compiler_optional_tools(message) & REFINEMENT_EXECUTION_TOOLS)
+    return selected
+
+
+def derive_prompt_value_lane_state(
+    messages: list[dict[str, Any]],
+    latest_user_message: str,
+) -> dict[str, bool]:
+    """Persist a prompt-only value-edit lane across two corrective reply turns."""
+
+    direct_edit = (
+        prompt_value_edit_requested(latest_user_message)
+        and not mask_edit_requested(latest_user_message)
+    )
+    correction = prompt_value_correction_requested(latest_user_message)
+    retry = prompt_value_retry_requested(latest_user_message)
+    if direct_edit and not correction:
+        return {
+            "active": True,
+            "referenceImage": (
+                prompt_reference_image_requested(latest_user_message)
+                or _immediate_reference_prompt_draft_handoff(
+                    messages,
+                    latest_user_message,
+                )
+            ),
+        }
+    if not (direct_edit or correction or retry):
+        return {"active": False, "referenceImage": False}
+
+    correction_turns = 0
+    skipped_latest = False
+    pending_context_inspection = False
+    for item in reversed(messages[-MASK_LANE_HISTORY_LIMIT:]):
+        if item.get("role") == "assistant":
+            stored = _assistant_prompt_lane_state(item)
+            if stored is not None:
+                if retry and stored.get("combinedMask") is True:
+                    continue
+                return {
+                    "active": True,
+                    "referenceImage": (
+                        prompt_reference_image_requested(latest_user_message)
+                        or (retry and stored["referenceImage"])
+                    ),
+                }
+            pending_context_inspection = _assistant_completed_prompt_context_inspection(
+                item
+            )
+            continue
+        if item.get("role") != "user":
+            continue
+        content = message_content_for_model(item)
+        if not skipped_latest and content == latest_user_message:
+            skipped_latest = True
+            continue
+        if pending_context_inspection:
+            pending_context_inspection = False
+            correction_turns += 1
+            if correction_turns <= PROMPT_VALUE_CORRECTION_TURN_LIMIT:
+                continue
+            break
+        if prompt_value_edit_requested(content) and not mask_edit_requested(content):
+            if prompt_value_correction_requested(content):
+                correction_turns += 1
+                if correction_turns <= PROMPT_VALUE_CORRECTION_TURN_LIMIT:
+                    continue
+                break
+            return {
+                "active": True,
+                "referenceImage": (
+                    prompt_reference_image_requested(latest_user_message)
+                    or (retry and prompt_reference_image_requested(content))
+                ),
+            }
+        if prompt_value_correction_requested(content) or prompt_value_retry_requested(content):
+            correction_turns += 1
+            if correction_turns <= PROMPT_VALUE_CORRECTION_TURN_LIMIT:
+                continue
+        break
+
+    if direct_edit:
+        return {
+            "active": True,
+            "referenceImage": prompt_reference_image_requested(latest_user_message),
+        }
+    return {"active": False, "referenceImage": False}
+
 
 def _graph_compiler_optional_tools(message: str) -> set[str]:
     """Expose follow-up tools only when the same request explicitly needs them."""
@@ -255,7 +1217,8 @@ def _graph_compiler_optional_tools(message: str) -> set[str]:
     execution_requested = bool(
         re.search(
             r"\b(?:run|queue|execute|render)\b"
-            r"|\b(?:review|inspect|validate)\b.{0,40}\b(?:output|result)\b",
+            r"|\b(?:review|inspect|validate|check|examine)\b.{0,40}\b(?:output|result)\b"
+            r"|\blook(?:ing)?\s+at\b.{0,40}\b(?:output|result)\b",
             visible,
         )
     ) and not execution_denied
@@ -678,6 +1641,107 @@ def _tool_checkpoint(message: dict[str, Any]) -> str:
     return ", ".join(summaries)
 
 
+def _structured_tool_result(step: dict[str, Any]) -> dict[str, Any] | None:
+    result = step.get("result")
+    if tool_result_is_error(result):
+        return None
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(result, dict):
+        return None
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+    return result
+
+
+def _safe_image_reference(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    reference = {
+        key: str(value[key])
+        for key in ("filename", "subfolder", "type")
+        if value.get(key) not in (None, "")
+    }
+    return reference or None
+
+
+def _bounded_lane_facts(message: dict[str, Any]) -> str:
+    """Retain safe mask/prompt locators across rollover without authority tokens."""
+
+    steps = (message.get("metadata") or {}).get("toolSteps") or []
+    for step in reversed(steps):
+        if not isinstance(step, dict) or step.get("status") != "done":
+            continue
+        name = str(step.get("name") or "")
+        if name not in {
+            "view_node_mask",
+            "edit_node_mask",
+            "confirm_mask_review",
+            "view_prompt_reference_image",
+            "update_connected_prompt",
+        }:
+            continue
+        result = _structured_tool_result(step)
+        if not result or result.get("success") is False:
+            continue
+        if name in {"update_connected_prompt", "view_prompt_reference_image"}:
+            facts = {
+                "kind": "prompt",
+                "node_id": result.get("node_id") or result.get("producer_node_id"),
+                "title": result.get("title") or result.get("producer_title"),
+                "widget": result.get("widget") or result.get("widget_name"),
+                "reference_node_id": result.get("reference_node_id"),
+                "consumer_node_id": result.get("consumer_node_id"),
+                "image": _safe_image_reference(result.get("image")),
+                "workflow_hash": result.get("workflow_hash"),
+                "graph_hash": result.get("graph_hash"),
+            }
+        else:
+            facts = {
+                "kind": "mask",
+                "node_id": result.get("node_id"),
+                "title": result.get("title"),
+                "image": _safe_image_reference(result.get("image")),
+                "source_image": _safe_image_reference(result.get("source_image")),
+                "original_size": result.get("originalSize") or result.get("image_size"),
+                "workflow_hash": result.get("workflow_hash"),
+                "graph_hash": result.get("graph_hash"),
+                "approved": result.get("approved"),
+            }
+        facts = {key: value for key, value in facts.items() if value not in (None, {}, "")}
+        return _bounded_context_text(
+            json.dumps(facts, ensure_ascii=False, separators=(",", ":")),
+            700,
+        )
+    return ""
+
+
+def _mask_lane_checkpoint(message: dict[str, Any]) -> str:
+    state = (message.get("metadata") or {}).get(MASK_LANE_STATE_KEY)
+    if not isinstance(state, dict) or state.get("active") is not True:
+        return ""
+    return (
+        "mask_lane=active"
+        f",prompt_value={str(bool(state.get('promptValueEdit'))).lower()}"
+        f",prompt_reference={str(bool(state.get('promptReferenceImage'))).lower()}"
+        f",attachment={str(bool(state.get('attachmentAvailable'))).lower()}"
+    )
+
+
+def _prompt_value_lane_checkpoint(message: dict[str, Any]) -> str:
+    state = (message.get("metadata") or {}).get(PROMPT_VALUE_LANE_STATE_KEY)
+    if not isinstance(state, dict) or state.get("active") is not True:
+        return ""
+    return (
+        "prompt_value_lane=active"
+        f",reference={str(bool(state.get('referenceImage'))).lower()}"
+    )
+
+
 def build_conversation_checkpoint(
     messages: list[dict[str, Any]],
     *,
@@ -703,6 +1767,15 @@ def build_conversation_checkpoint(
         line = f"- {role} [{status}]: {excerpt or '(no text)'}"
         if tools:
             line += f" | tools: {tools}"
+        mask_lane = _mask_lane_checkpoint(message)
+        if mask_lane:
+            line += f" | {mask_lane}"
+        prompt_value_lane = _prompt_value_lane_checkpoint(message)
+        if prompt_value_lane:
+            line += f" | {prompt_value_lane}"
+        lane_facts = _bounded_lane_facts(message)
+        if lane_facts:
+            line += f" | lane_facts={lane_facts}"
         if len(line) + 1 > remaining:
             omitted += 1
             continue
@@ -714,33 +1787,77 @@ def build_conversation_checkpoint(
     return _bounded_context_text("\n".join(lines), max_chars)
 
 
-def _usage_token_high_watermark(value: Any) -> int:
-    """Return the largest reported token counter in nested provider metadata."""
-    if isinstance(value, dict):
-        values = [
-            _usage_token_high_watermark(item)
-            for key, item in value.items()
-            if "token" in str(key).lower() or isinstance(item, (dict, list))
-        ]
-        return max(values, default=0)
-    if isinstance(value, list):
-        return max((_usage_token_high_watermark(item) for item in value), default=0)
-    if isinstance(value, (int, float)) and value >= 0:
-        return int(value)
-    return 0
+def _current_context_tokens(value: Any) -> int:
+    """Read current-turn input/context usage, never historical cumulative totals."""
+
+    if not isinstance(value, dict):
+        return 0
+    if isinstance(value.get("last"), dict):
+        value = value["last"]
+    current_keys = {
+        "inputtokens",
+        "input_tokens",
+        "prompttokens",
+        "prompt_tokens",
+        "contexttokens",
+        "context_tokens",
+    }
+    values = [
+        int(item)
+        for key, item in value.items()
+        if str(key).casefold() in current_keys
+        and isinstance(item, (int, float))
+        and item >= 0
+    ]
+    return max(values, default=0)
+
+
+def _provider_thread_id(message: dict[str, Any]) -> tuple[str, str] | None:
+    metadata = message.get("metadata") or {}
+    for key in ("codexThreadId", "claudeSessionId"):
+        value = metadata.get(key)
+        if value:
+            return key, str(value)
+    return None
+
+
+def current_provider_thread_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return only messages belonging to the currently resumable native thread."""
+
+    current = next(
+        (
+            _provider_thread_id(message)
+            for message in reversed(messages)
+            if _provider_thread_id(message) is not None
+        ),
+        None,
+    )
+    if current is None:
+        return messages
+
+    start = 0
+    for index in range(len(messages) - 1, -1, -1):
+        thread = _provider_thread_id(messages[index])
+        if thread is not None and thread != current:
+            start = index + 1
+            break
+    return messages[start:]
 
 
 def conversation_needs_compaction(messages: list[dict[str, Any]]) -> bool:
     """Detect large local histories or native threads near a costly context size."""
+    active_messages = current_provider_thread_messages(messages)
     context_size = sum(
         len(_message_for_context(message)["content"]) + 64
-        for message in messages
+        for message in active_messages
         if message.get("role") in {"user", "assistant"}
     )
     provider_tokens = max(
         (
-            _usage_token_high_watermark((message.get("metadata") or {}).get("usage"))
-            for message in messages
+            _current_context_tokens((message.get("metadata") or {}).get("usage"))
+            for message in active_messages
         ),
         default=0,
     )
@@ -802,9 +1919,11 @@ def native_prompt_with_compaction(
     latest_user_message: str,
     *,
     bootstrap: bool = False,
+    force: bool = False,
+    rollover_reason: str = "context_limit",
 ) -> tuple[str, bool]:
     """Prepare bounded history when starting or rolling over a native provider thread."""
-    needs_compaction = conversation_needs_compaction(messages)
+    needs_compaction = force or conversation_needs_compaction(messages)
     if not needs_compaction and not bootstrap:
         return latest_user_message, False
     compacted, _ = compact_messages_for_model(messages, force=True)
@@ -819,6 +1938,11 @@ def native_prompt_with_compaction(
         ),
         "Use this bounded conversation context, then handle the current user reply.",
     ]
+    if rollover_reason == "tool_surface_changed":
+        sections.append(
+            "The current Ren tool surface is authoritative. Ignore earlier claims "
+            "or discovery results about which tools are available."
+        )
     for item in prior:
         sections.append(f"\n[{item['role']}]\n{item['content']}")
     sections.append(f"\n[current user request]\n{latest_user_message}")
@@ -827,6 +1951,44 @@ def native_prompt_with_compaction(
         needs_compaction,
     )
 
+
+REN_TOOL_SURFACE_KEY = "renToolSurface"
+
+
+def canonical_ren_tool_surface(tool_names: set[str]) -> dict[str, Any]:
+    """Return the exact sorted Ren tool set bound to one native provider thread."""
+
+    return {
+        "buildId": RUNTIME_BUILD_ID,
+        "tools": sorted(tool_names),
+    }
+
+
+def resumable_provider_thread(
+    messages: list[dict[str, Any]],
+    *,
+    thread_key: str,
+    tool_surface: dict[str, Any],
+) -> tuple[str | None, bool]:
+    """Resume only a native thread created with the same exact Ren MCP catalog."""
+
+    prior = next(
+        (
+            item
+            for item in reversed(messages)
+            if item.get("role") == "assistant"
+            and item.get("metadata", {}).get(thread_key)
+        ),
+        None,
+    )
+    if prior is None:
+        return None, False
+    metadata = prior.get("metadata") or {}
+    thread_id = str(metadata[thread_key])
+    if metadata.get(REN_TOOL_SURFACE_KEY) != tool_surface:
+        return None, True
+    return thread_id, False
+
 INTENT_TOOL_GROUPS = {
     "debug": {
         "get_execution_history",
@@ -834,6 +1996,8 @@ INTENT_TOOL_GROUPS = {
         "get_queue_status_details",
         "clear_error_buffer",
         "comfy_get_logs",
+        "comfy_jobs_list",
+        "comfy_job_get",
     },
     "manager": {
         "manager_search_nodes",
@@ -842,11 +2006,19 @@ INTENT_TOOL_GROUPS = {
         "manager_queue_action",
         "manager_queue_status",
         "manager_queue_start",
+        "manager_queue_reset",
         "manager_v4_installed_packs",
+        "manager_v4_status",
+        "manager_v4_snapshots",
+        "comfy_node_replacements_get",
     },
     "models": {
         "comfy_models_list",
         "comfy_assets_list",
+        "comfy_asset_get",
+        "comfy_asset_upload",
+        "comfy_tags_list",
+        "comfy_list_folders",
         "comfy_search_resources",
         "manager_search_external_models",
     },
@@ -857,6 +2029,12 @@ INTENT_TOOL_GROUPS = {
         "custom_nodes_write_file",
         "custom_nodes_apply_patch",
         "custom_nodes_validate_pack",
+        "custom_nodes_create_pack",
+        "custom_nodes_git_status",
+        "custom_nodes_git_diff",
+        "custom_nodes_git_commit",
+        "custom_nodes_git_push",
+        "comfy_read_file",
     },
     "files": {
         "workflow_list_files",
@@ -864,7 +2042,198 @@ INTENT_TOOL_GROUPS = {
         "workflow_save_current",
         "workflow_load_json",
         "workflow_delete_file",
+        "workflow_rename_file",
+        "extract_workflow_from_image",
     },
+    "graph_query": {
+        "query_workflow",
+        "workflow_diagram",
+        "node_library_find_compatible",
+    },
+    "queue_control": {
+        "cancel_workflow",
+        "delete_queue_items",
+        "enable_auto_queue",
+        "disable_auto_queue",
+        "set_batch_count",
+        "comfy_history_delete",
+    },
+    "canvas_ops": {
+        "bypass_nodes",
+        "unbypass_nodes",
+        "pin_nodes",
+        "unpin_nodes",
+        "select_nodes",
+        "focus_on_nodes",
+    },
+    "tabs": {
+        "workflow_get_tabs",
+        "workflow_close_current",
+        "workflow_duplicate_current",
+    },
+    "templates": {
+        "comfy_workflow_templates_list",
+        "comfy_global_subgraphs_list",
+    },
+    "uploads": {
+        "comfy_upload_image",
+        "comfy_upload_mask",
+    },
+    "ui_commands": {
+        "frontend_list_commands",
+        "frontend_list_keybindings",
+        "frontend_execute_command",
+    },
+    "system": {
+        "comfy_status",
+        "comfy_restart",
+        "comfy_free_memory",
+        "get_system_info",
+        "comfy_settings_get",
+        "comfy_settings_set",
+    },
+    "utility": {
+        "generate_seed",
+        "generate_int",
+        "generate_float",
+        "random_choice",
+        "calculate_expressions",
+    },
+}
+
+# Word-boundary triggers for the intent groups above that are not covered by
+# the older substring keyword checks in tools_for_message. Patterns accept
+# morphological variants (-ing/-ed/-s) deliberately: matching only bare verb
+# stems silently missed exactly the phrasings real users type ("I'm searching
+# for..." vs "search").
+INTENT_GROUP_TRIGGERS: dict[str, re.Pattern[str]] = {
+    "debug": re.compile(r"\bjobs?\b", re.IGNORECASE),
+    "manager": re.compile(
+        r"\b(?:deprecated|replacements?|snapshots?)\b",
+        re.IGNORECASE,
+    ),
+    "models": re.compile(r"\btags?\b|\blist\s+folders?\b", re.IGNORECASE),
+    "coding": re.compile(r"\bgit\b|\bcommit(?:ted|ting|s)?\b|\bdiff\b", re.IGNORECASE),
+    "files": re.compile(
+        r"\brenam(?:e|ed|ing)\b|\bmove\s+(?:the\s+)?workflow\b"
+        r"|\bextract(?:ed|ing)?\b.{0,40}\bworkflow\b"
+        r"|\bworkflow\b.{0,30}\bfrom\s+(?:the\s+|this\s+)?(?:image|png|screenshot)\b"
+        r"|\b(?:png|image)\s+metadata\b"
+        r"|\b(?:recreate|rebuild)\b.{0,30}\bworkflow\b"
+        r"|\bhow\s+was\s+(?:this|that)\s+image\s+made\b",
+        re.IGNORECASE,
+    ),
+    "graph_query": re.compile(
+        r"\bwhich\s+nodes?\b|\bhow\s+many\s+nodes?\b|\bupstream\b|\bdownstream\b"
+        r"|\bconnected\s+to\b|\btrac(?:e|ed|ing)\b|\bwhat\s+feeds\b"
+        r"|\bdiagrams?\b|\bmermaid\b|\bvisuali[sz](?:e|ed|ing)\b|\bflow\s?charts?\b"
+        r"|\bcompatible\b|\bwhat\s+can\s+i\s+connect\b"
+        r"|\b(?:goes|comes)\s+(?:before|after|next)\b",
+        re.IGNORECASE,
+    ),
+    "queue_control": re.compile(
+        r"\bcancel(?:led|ling|ed|ing|s)?\b|\bstop(?:ped|ping|s)?\b"
+        r"|\binterrupt(?:ed|ing|s)?\b|\babort(?:ed|ing|s)?\b"
+        r"|\bauto[- ]?queue\b|\bcontinuous\s+generation\b"
+        r"|\bbatch(?:es)?\b|\bclear\b.{0,30}\b(?:queue|history)\b",
+        re.IGNORECASE,
+    ),
+    "canvas_ops": re.compile(
+        r"\bbypass(?:ed|ing|es)?\b|\b(?:un)?mut(?:e|ed|ing)\b"
+        r"|\b(?:un)?pin(?:ned|ning|s)?\b|\block\s+(?:the\s+|this\s+|that\s+)?nodes?\b"
+        r"|\bselect(?:ed|ing)?\b.{0,30}\bnodes?\b"
+        r"|\bfocus(?:ed|ing)?\s+on\b|\b(?:disable|enable)\b.{0,20}\bnodes?\b",
+        re.IGNORECASE,
+    ),
+    "tabs": re.compile(
+        r"\btabs\b|\b(?:which|active|current|open|switch|close)\s+tab\b"
+        r"|\b(?:close|duplicat(?:e|ed|ing)|copy\s+of)\b.{0,20}\b(?:workflow|tab)\b",
+        re.IGNORECASE,
+    ),
+    "templates": re.compile(
+        r"\btemplates?\b|\bsubgraphs?\b"
+        r"|\b(?:example|starter|preset)\s+workflows?\b",
+        re.IGNORECASE,
+    ),
+    "uploads": re.compile(
+        r"\bupload(?:ed|ing|s)?\b|\binput\s+folder\b|\bimport\s+(?:an?\s+)?image\b",
+        re.IGNORECASE,
+    ),
+    "ui_commands": re.compile(
+        r"\bhot\s?keys?\b|\bshortcuts?\b|\bkey\s?bindings?\b"
+        r"|\b(?:frontend|ui)\s+commands?\b|\bundo\b|\bredo\b",
+        re.IGNORECASE,
+    ),
+    "system": re.compile(
+        r"\brestart(?:ed|ing|s)?\b|\breboot(?:ed|ing)?\b|\bcrash(?:ed|ing|es)?\b"
+        r"|\bnot\s+responding\b|\bfrozen\b|\bserver\s+status\b"
+        r"|\bout\s+of\s+memory\b|\bvram\b|\bfree\s+(?:up\s+)?memory\b"
+        r"|\bunload\s+models?\b|\bcuda\b|\bsystem\s+info\b|\bgpu\b"
+        r"|\bpython\s+version\b|\boperating\s+system\b|\bsettings?\b|\bpreferences?\b",
+        re.IGNORECASE,
+    ),
+    "utility": re.compile(
+        r"\bseeds?\b|\brandom(?:ized?|izing|ly)?\b|\bshuffl(?:e|ed|ing)\b"
+        r"|\bpick\s+one\b|\bcalculat(?:e|ed|ing|ion)\b",
+        re.IGNORECASE,
+    ),
+}
+
+# Inside the graph-change lane (which narrows the tool set down to the
+# compiler pair), a triggered group survives only if its intent is clearly
+# operational rather than incidental vocabulary of a graph edit. "Change the
+# seed on the selected node to 7" mentions "seed" and "selected node" but is
+# purely a compiler value edit; "pin these nodes so they don't move" names an
+# actual canvas-state operation the compiler cannot perform. Groups listed
+# here must re-match this stricter pattern to be re-added after narrowing;
+# groups not listed are always re-added when triggered.
+GRAPH_LANE_STRONG_TRIGGERS: dict[str, re.Pattern[str]] = {
+    "canvas_ops": re.compile(
+        r"\bbypass(?:ed|ing|es)?\b|\b(?:un)?mut(?:e|ed|ing)\b"
+        r"|\b(?:un)?pin(?:ned|ning|s)?\b|\block\s+(?:the\s+|this\s+|that\s+)?nodes?\b"
+        r"|\bfocus(?:ed|ing)?\s+on\b|\b(?:disable|enable)\b.{0,20}\bnodes?\b",
+        re.IGNORECASE,
+    ),
+    "utility": re.compile(
+        r"\brandom(?:ized?|izing|ly)?\b|\bshuffl(?:e|ed|ing)\b"
+        r"|\bpick\s+one\b|\bcalculat(?:e|ed|ing|ion)\b",
+        re.IGNORECASE,
+    ),
+}
+
+# Registered MCP tools that are deliberately NOT selectable by the chat
+# runtime. Each entry needs a reason; the reachability test in
+# tests/test_tool_reachability.py fails if a registered tool is neither
+# selectable nor listed here, so a new tool cannot silently ship unreachable.
+DELIBERATELY_UNEXPOSED_TOOLS = {
+    "plan_workflow_refinement": (
+        "Retired Gen-2 pair, removed from chat selection in commit 9f0bb05; "
+        "superseded by compile_workflow_refinement_spec."
+    ),
+    "apply_workflow_refinement": (
+        "Retired Gen-2 pair, removed from chat selection in commit 9f0bb05; "
+        "superseded by apply_workflow_graph_patch."
+    ),
+    "connect_nodes": (
+        "Superseded by connect_nodes_batch, which handles a single "
+        "connection as a batch of one with the same auto_match semantics."
+    ),
+    "auto_connect_workflow": (
+        "Nondeterministic bulk type-match connect; replaced by the "
+        "deterministic GraphPatch refinement lane."
+    ),
+    "comfy_assets_upload": (
+        "Bulk variant of comfy_asset_upload; the single-asset tool is "
+        "exposed instead."
+    ),
+    "custom_nodes_read_file": (
+        "Superseded by custom_nodes_read_file_excerpt, whose bounded reads "
+        "keep responses within context limits."
+    ),
+    "manager_v4_queue_status": "Duplicate of exposed manager_queue_status.",
+    "manager_v4_queue_action": "Duplicate of exposed manager_queue_action.",
+    "manager_v4_node_mappings": "Duplicate of exposed manager_get_node_mappings.",
+    "manager_v4_external_models": "Duplicate of exposed manager_search_external_models.",
 }
 
 CLAUDE_BUILTIN_TOOLS = {
@@ -936,6 +2305,82 @@ def tool_result_content(content: Any) -> str:
         content = content.model_dump(mode="json", by_alias=True)
     content = _redact_binary_tool_content(content)
     return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+
+
+def tool_result_is_error(content: Any) -> bool:
+    """Classify explicit MCP/tool failures instead of displaying them as done."""
+
+    value = content
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return bool(re.match(
+                r"\s*(?:error calling tool|error:|\d+\s+validation errors?\s+for\s+call\[)",
+                value,
+                re.IGNORECASE,
+            ))
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json", by_alias=True)
+    if isinstance(value, list):
+        return any(tool_result_is_error(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    if value.get("type") == "text":
+        text = str(value.get("text") or "")
+        if re.match(r"\s*(?:error calling tool|error:)", text, re.IGNORECASE):
+            return True
+        stripped = text.lstrip()
+        if stripped.startswith(("{", "[")):
+            try:
+                return tool_result_is_error(json.loads(stripped))
+            except json.JSONDecodeError:
+                return False
+        return False
+    if (
+        value.get("isError") is True
+        or value.get("is_error") is True
+        or value.get("success") is False
+    ):
+        return True
+    if value.get("error") not in (None, "", False):
+        return True
+    structured = value.get("structuredContent")
+    if isinstance(structured, dict) and (
+        structured.get("success") is False
+        or structured.get("error") not in (None, "", False)
+    ):
+        return True
+    blocks = value.get("content")
+    if isinstance(blocks, list):
+        return tool_result_is_error(blocks)
+    return False
+
+
+def tool_result_needs_choice(content: Any) -> bool:
+    """Recognize a semantic choice stop without presenting it as a tool crash."""
+
+    value = content
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return False
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json", by_alias=True)
+    if isinstance(value, list):
+        return any(tool_result_needs_choice(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    if value.get("needs_choice") is True:
+        return True
+    structured = value.get("structuredContent")
+    if isinstance(structured, dict) and structured.get("needs_choice") is True:
+        return True
+    if value.get("type") == "text":
+        return tool_result_needs_choice(value.get("text"))
+    blocks = value.get("content")
+    return isinstance(blocks, list) and tool_result_needs_choice(blocks)
 
 
 def model_settings_for_provider(settings: dict[str, Any]) -> dict[str, Any]:
@@ -1235,16 +2680,71 @@ def install_codex_approval_handler(codex: Any, handler: Callable[..., Any]) -> N
     sync_client._approval_handler = handler
 
 
+class ProviderToolSurfaceMismatch(RuntimeError):
+    """The provider did not expose the exact Ren tools selected for this turn."""
+
+    code = "provider_tool_surface_mismatch"
+
+
+def require_provider_tool_surface(
+    expected: set[str],
+    exposed: set[str],
+    *,
+    provider: str,
+    exact: bool = True,
+) -> None:
+    """Fail before inference when provider tool discovery is stale or incomplete."""
+
+    missing = sorted(expected - exposed)[:16]
+    unexpected = sorted(exposed - expected)[:16] if exact else []
+    if not missing and not unexpected:
+        return
+    facts = []
+    if missing:
+        facts.append(f"missing={','.join(missing)}")
+    if unexpected:
+        facts.append(f"unexpected={','.join(unexpected)}")
+    raise ProviderToolSurfaceMismatch(
+        "provider_tool_surface_mismatch: "
+        f"{provider} exposed a different Ren tool surface ({'; '.join(facts)}). "
+        "No model turn or canvas action was started."
+    )
+
+
+def prepare_provider_tools(
+    tool_definitions: list[Any],
+    allowed_tools: set[str],
+    *,
+    provider: str = "pydantic",
+) -> list[Any]:
+    """Validate MCP discovery, then return only this turn's selected tools."""
+
+    exposed = {str(definition.name) for definition in tool_definitions}
+    require_provider_tool_surface(
+        allowed_tools,
+        exposed,
+        provider=provider,
+        exact=False,
+    )
+    return [
+        definition
+        for definition in tool_definitions
+        if definition.name in allowed_tools
+    ]
+
+
 async def wait_for_claude_mcp(
     client: Any,
     *,
     server_name: str = "ren",
+    expected_tools: set[str] | None = None,
     timeout: float = 15,
 ) -> None:
     """Wait until Claude Code has discovered Ren's MCP tools."""
     deadline = asyncio.get_running_loop().time() + timeout
     last_status = "pending"
     last_error = None
+    last_surface_error: ProviderToolSurfaceMismatch | None = None
     while True:
         response = await client.get_mcp_status()
         servers = response.get("mcpServers", []) if isinstance(response, dict) else []
@@ -1260,7 +2760,24 @@ async def wait_for_claude_mcp(
             last_status = str(server.get("status") or "pending")
             last_error = server.get("error")
             if last_status == "connected":
-                return
+                if expected_tools is None:
+                    return
+                exposed = set()
+                for tool in server.get("tools") or []:
+                    if not isinstance(tool, dict) or not tool.get("name"):
+                        continue
+                    raw_name = str(tool["name"])
+                    exposed.add(claude_tool_name(raw_name) or raw_name)
+                try:
+                    require_provider_tool_surface(
+                        expected_tools,
+                        exposed,
+                        provider="claude",
+                    )
+                except ProviderToolSurfaceMismatch as exc:
+                    last_surface_error = exc
+                else:
+                    return
             if last_status in {"failed", "needs-auth", "disabled"}:
                 detail = f": {last_error}" if last_error else ""
                 raise RuntimeError(
@@ -1268,6 +2785,8 @@ async def wait_for_claude_mcp(
                     f"({last_status}){detail}"
                 )
         if asyncio.get_running_loop().time() >= deadline:
+            if last_surface_error is not None:
+                raise last_surface_error
             detail = f": {last_error}" if last_error else ""
             raise RuntimeError(
                 f"Claude Code timed out waiting for the Ren MCP server "
@@ -1281,23 +2800,225 @@ async def wait_for_codex_mcp_status(
     status_params: dict[str, Any],
     response_model: Any,
     *,
+    expected_tools: set[str] | None = None,
     timeout: float = 30,
 ) -> Any:
     """Bound Codex MCP discovery so a broken provider cannot freeze the chat."""
-    try:
-        return await asyncio.wait_for(
-            client.request(
-                "mcpServerStatus/list",
-                status_params,
-                response_model=response_model,
-            ),
-            timeout=timeout,
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_surface_error: ProviderToolSurfaceMismatch | None = None
+    while True:
+        remaining = max(0, deadline - asyncio.get_running_loop().time())
+        try:
+            response = await asyncio.wait_for(
+                client.request(
+                    "mcpServerStatus/list",
+                    status_params,
+                    response_model=response_model,
+                ),
+                timeout=remaining,
+            )
+        except TimeoutError as exc:
+            if last_surface_error is not None:
+                raise last_surface_error from exc
+            raise RuntimeError(
+                "Codex timed out while connecting to the Ren MCP tools. "
+                "Stop the response and retry."
+            ) from exc
+        if expected_tools is None:
+            return response
+        ren_status = next(
+            (item for item in response.data if item.name == "ren"),
+            None,
         )
-    except TimeoutError as exc:
-        raise RuntimeError(
-            "Codex timed out while connecting to the Ren MCP tools. "
-            "Stop the response and retry."
-        ) from exc
+        try:
+            require_provider_tool_surface(
+                expected_tools,
+                set(ren_status.tools) if ren_status is not None else set(),
+                provider="codex",
+            )
+        except ProviderToolSurfaceMismatch as exc:
+            last_surface_error = exc
+        else:
+            return response
+        if asyncio.get_running_loop().time() >= deadline:
+            raise last_surface_error from None
+        await asyncio.sleep(0.1)
+
+
+def tools_for_message(
+    message: str,
+    search_mode: str = "off",
+    *,
+    mask_lane_state: dict[str, bool] | None = None,
+    prompt_value_lane_state: dict[str, bool] | None = None,
+) -> set[str]:
+    text = message.lower()
+    branch_intent = workflow_branch_intent(message)
+    canvas_inspection = canvas_image_inspection_requested(message)
+    graph_change_requested = workflow_graph_change_requested(message)
+    if canvas_inspection and canvas_mutation_explicitly_denied(message):
+        graph_change_requested = False
+    mask_lane = mask_lane_state or (
+        _new_mask_lane_state(message)
+        if mask_edit_requested(message)
+        else {"active": False}
+    )
+    prompt_value_lane = prompt_value_lane_state or {
+        "active": prompt_value_edit_requested(message) and not mask_edit_requested(message),
+        "referenceImage": prompt_reference_image_requested(message),
+    }
+    selected = CORE_CHAT_TOOLS | CANVAS_CHAT_TOOLS
+    if canvas_inspection:
+        selected.update(CANVAS_IMAGE_INSPECTION_TOOLS)
+    if _prompt_value_tool_candidate(message):
+        selected.update(PROMPT_VALUE_TOOLS)
+    debug_requested = any(
+        word in text
+        for word in (
+            "error", "broken", "debug", "failed", "queue", "output", "result",
+            "review", "validate", "distortion", "artifact",
+        )
+    )
+    # A refinement request commonly says which image output should feed a new
+    # node. That noun alone is not an execution-debug request, and enabling the
+    # full diagnostics group only adds irrelevant tool choices. Visual, mask,
+    # and attachment tools remain in CORE_CHAT_TOOLS.
+    if debug_requested or ("image" in text and not graph_change_requested):
+        selected.update(INTENT_TOOL_GROUPS["debug"])
+    if any(
+        word in text
+        for word in ("install", "manager", "missing node", "custom node", "update node")
+    ):
+        selected.update(INTENT_TOOL_GROUPS["manager"])
+    if any(word in text for word in ("model", "checkpoint", "lora", "vae", "asset")):
+        selected.update(INTENT_TOOL_GROUPS["models"])
+    if any(word in text for word in ("code", "python", "javascript", "custom node pack")):
+        selected.update(INTENT_TOOL_GROUPS["coding"])
+    if any(
+        word in text
+        for word in ("save workflow", "load workflow", "workflow file", "delete workflow")
+    ):
+        selected.update(INTENT_TOOL_GROUPS["files"])
+    triggered_groups = {
+        group_name
+        for group_name, trigger in INTENT_GROUP_TRIGGERS.items()
+        if trigger.search(text)
+    }
+    for group_name in triggered_groups:
+        selected.update(INTENT_TOOL_GROUPS[group_name])
+    if search_mode != "off":
+        selected.update({"web_search", "web_fetch_page"})
+    if branch_intent is not None:
+        branch_tools = {
+            "discover": BRANCH_DISCOVERY_TOOLS,
+            "navigate": BRANCH_NAVIGATION_TOOLS,
+            "compare": BRANCH_COMPARISON_TOOLS,
+            "clone": BRANCH_MUTATION_TOOLS,
+            "replace": BRANCH_MUTATION_TOOLS,
+            "remove": BRANCH_MUTATION_TOOLS,
+        }[branch_intent]
+        selected = set(branch_tools)
+        if branch_intent in {"clone", "replace", "remove"}:
+            selected.update(_graph_compiler_optional_tools(message))
+        return selected
+    if prompt_value_lane.get("active") and not explicit_topology_change_requested(message):
+        prompt_tools = set(PROMPT_VALUE_TOOLS)
+        if prompt_value_lane.get("referenceImage"):
+            prompt_tools.update(PROMPT_REFERENCE_TOOLS)
+        if canvas_image_inspection_requested(message):
+            prompt_tools.update(CANVAS_IMAGE_INSPECTION_TOOLS)
+        if _message_has_attachment_context(message):
+            prompt_tools.add("view_chat_image")
+        return prompt_tools
+    if mask_lane.get("active") and not explicit_topology_change_requested(message):
+        return _mask_lane_tools(message, mask_lane)
+    if canvas_inspection and not graph_change_requested:
+        # Pixel inspection and node-to-input mapping need a small read-only
+        # surface. Do not expose queueing or canvas mutation for this lane.
+        return set(CANVAS_IMAGE_READ_ONLY_TOOLS)
+    if workflow_layout_arrangement_requested(message):
+        return CANVAS_CHAT_TOOLS | LAYOUT_TOOLS
+    if workflow_layout_inspection_requested(message):
+        return set(INSPECTION_CHAT_TOOLS)
+    if graph_change_requested:
+        # Empty-canvas builds and existing-graph edits use the same arbitrary-DAG
+        # compiler, schema guards, transaction, rollback, and two-call surface.
+        selected.intersection_update(REFINEMENT_COMPILER_TOOLS)
+        selected.update(_graph_compiler_optional_tools(message))
+        if explicit_node_knowledge_requested(message):
+            selected.add("node_knowledge_search")
+        if explicit_web_research_requested(message) and search_mode != "off":
+            selected.update({"web_search", "web_fetch_page"})
+        else:
+            selected.difference_update({"web_search", "web_fetch_page"})
+        # A combined inspect-then-edit request needs both the exact visual reader
+        # and the compiler pair. Never let the graph lane erase an explicitly
+        # requested read-only canvas capability.
+        if canvas_inspection:
+            selected.update(CANVAS_IMAGE_INSPECTION_TOOLS)
+        # The same principle holds for explicitly triggered intent groups:
+        # "pin these nodes" or "duplicate this workflow" may read as a graph
+        # change, but the tools that actually satisfy them (canvas state
+        # toggles, tab management, queue control, ...) are not the low-level
+        # mutation tools the narrowing exists to remove, and the compiler
+        # pair cannot perform them. Groups whose vocabulary commonly appears
+        # incidentally inside graph-edit sentences must re-match their
+        # stricter graph-lane pattern to survive.
+        for group_name in triggered_groups:
+            strong = GRAPH_LANE_STRONG_TRIGGERS.get(group_name)
+            if strong is None or strong.search(text):
+                selected.update(INTENT_TOOL_GROUPS[group_name])
+    return selected
+
+
+
+_CONTEXTUAL_CONTINUATION = re.compile(
+    r"(?:please\s+)?(?:proceed|continue|carry\s+on|go\s+ahead|go\s+for\s+it|"
+    r"do\s+it|please\s+do|apply\s+it|make\s+(?:the|that)\s+change|"
+    r"make\s+it\s+so|sounds\s+good|yes|yep|yeah|sure|okay|ok)"
+    r"(?:\s+(?:please|now|with\s+(?:it|that|the\s+plan)))?[.!]*",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_RETRY = re.compile(
+    r"(?:please\s+)?(?:retry|try)(?:\s+(?:it\s+)?(?:now|again))?[.!]*",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_SELECTION = re.compile(
+    r"(?:(?:option|choice|number)\s+(?:\d+|one|two|three)|"
+    r"the\s+(?:first|second|third)\s+(?:one|option)|"
+    r"(?:first|second|third)\s+(?:one|option))[.!]*",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_AFFIRMATION = re.compile(
+    r"(?:yes|yep|yeah|sure|okay|ok)\s*[,;:\-]?\s+"
+    r"(?:use|with|choose|pick|select|make|apply|keep|set|the|option|choice|number)\b",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_PREFIX = re.compile(
+    r"(?:please\s+)?(?:proceed|continue|carry\s+on|go\s+ahead|retry|try\s+again)\s+"
+    r"(?:with|using|but|and)\b",
+    re.IGNORECASE,
+)
+_TURN_CONTEXT_SCAN_USERS = 20
+_TURN_CONTEXT_SOURCE_CHARS = 8_000
+
+
+def contextual_reply_reason(value: str) -> str | None:
+    """Classify short replies that depend on an earlier user request."""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return None
+    if _CONTEXTUAL_RETRY.fullmatch(text):
+        return "retry"
+    if _CONTEXTUAL_SELECTION.fullmatch(text):
+        return "selection"
+    if _CONTEXTUAL_CONTINUATION.fullmatch(text):
+        return "continuation"
+    if len(text) <= 240 and _CONTEXTUAL_PREFIX.match(text):
+        return "continuation"
+    if len(text) <= 240 and _CONTEXTUAL_AFFIRMATION.match(text):
+        return "affirmation"
+    return None
 
 
 def _request_specific_tools_for_message(
@@ -1416,63 +3137,6 @@ def _request_specific_tools_for_message(
     return selected
 
 
-def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
-    """Always expose core canvas controls and add narrow task-specific tools."""
-    return CANVAS_CHAT_TOOLS | _request_specific_tools_for_message(
-        message,
-        search_mode,
-    )
-
-
-_CONTEXTUAL_CONTINUATION = re.compile(
-    r"(?:please\s+)?(?:proceed|continue|carry\s+on|go\s+ahead|go\s+for\s+it|"
-    r"do\s+it|please\s+do|apply\s+it|make\s+(?:the|that)\s+change|"
-    r"make\s+it\s+so|sounds\s+good|yes|yep|yeah|sure|okay|ok)"
-    r"(?:\s+(?:please|now|with\s+(?:it|that|the\s+plan)))?[.!]*",
-    re.IGNORECASE,
-)
-_CONTEXTUAL_RETRY = re.compile(
-    r"(?:please\s+)?(?:retry|try)(?:\s+(?:it\s+)?(?:now|again))?[.!]*",
-    re.IGNORECASE,
-)
-_CONTEXTUAL_SELECTION = re.compile(
-    r"(?:(?:option|choice|number)\s+(?:\d+|one|two|three)|"
-    r"the\s+(?:first|second|third)\s+(?:one|option)|"
-    r"(?:first|second|third)\s+(?:one|option))[.!]*",
-    re.IGNORECASE,
-)
-_CONTEXTUAL_AFFIRMATION = re.compile(
-    r"(?:yes|yep|yeah|sure|okay|ok)\s*[,;:\-]?\s+"
-    r"(?:use|with|choose|pick|select|make|apply|keep|set|the|option|choice|number)\b",
-    re.IGNORECASE,
-)
-_CONTEXTUAL_PREFIX = re.compile(
-    r"(?:please\s+)?(?:proceed|continue|carry\s+on|go\s+ahead|retry|try\s+again)\s+"
-    r"(?:with|using|but|and)\b",
-    re.IGNORECASE,
-)
-_TURN_CONTEXT_SCAN_USERS = 20
-_TURN_CONTEXT_SOURCE_CHARS = 8_000
-
-
-def contextual_reply_reason(value: str) -> str | None:
-    """Classify short replies that depend on an earlier user request."""
-    text = " ".join(str(value or "").split())
-    if not text:
-        return None
-    if _CONTEXTUAL_RETRY.fullmatch(text):
-        return "retry"
-    if _CONTEXTUAL_SELECTION.fullmatch(text):
-        return "selection"
-    if _CONTEXTUAL_CONTINUATION.fullmatch(text):
-        return "continuation"
-    if len(text) <= 240 and _CONTEXTUAL_PREFIX.match(text):
-        return "continuation"
-    if len(text) <= 240 and _CONTEXTUAL_AFFIRMATION.match(text):
-        return "affirmation"
-    return None
-
-
 def resolve_turn_context(
     messages: list[dict[str, Any]],
     latest_user_item: dict[str, Any],
@@ -1515,7 +3179,11 @@ def resolve_turn_context(
             latest_user_message=latest,
             routing_message=latest,
             provider_user_message=latest,
-            allowed_tools=tools_for_message(latest, search_mode),
+            allowed_tools=tools_for_message(
+            latest, search_mode,
+            mask_lane_state=derive_mask_lane_state(messages, latest),
+            prompt_value_lane_state=derive_prompt_value_lane_state(messages, latest),
+        ),
         )
 
     source_message = _bounded_context_text(
@@ -1535,7 +3203,11 @@ def resolve_turn_context(
         latest_user_message=latest,
         routing_message=routing_message,
         provider_user_message=provider_user_message,
-        allowed_tools=tools_for_message(routing_message, search_mode),
+        allowed_tools=tools_for_message(
+            routing_message, search_mode,
+            mask_lane_state=derive_mask_lane_state(messages, routing_message),
+            prompt_value_lane_state=derive_prompt_value_lane_state(messages, routing_message),
+        ),
         inherited_source_message_id=str(source.get("id") or "") or None,
         inheritance_reason=reason,
     )
@@ -1675,8 +3347,10 @@ def registry_discovery_instructions() -> str:
         "is sufficient unless the "
         "result reports a mismatch. These are the normal two workflow-building calls. Do "
         "not separately call workflow JSON, overview, catalog status, node search/details, "
-        "values, slots, layout, legacy compiler/planner, attachment placement, or low-level "
-        "create/connect/remove tools around them. If `needs_choice=true`, present the "
+        "values, slots, layout, `compile_workflow_spec`/`resolve_workflow_spec`/"
+        "`plan_workflow`/`apply_workflow_plan` (legacy fallback compilers), attachment "
+        "placement, or low-level create/connect/remove tools around them. If "
+        "`needs_choice=true`, present the "
         "ranked node, endpoint, or route candidates and wait; never accept an alphabetical "
         "guess. Partner review "
         "facts returned by the compiler are sufficient for a build-only request; do not "
@@ -1925,15 +3599,87 @@ def attachment_and_mask_instructions(allowed_tools: set[str]) -> str:
     sections = []
     if "view_chat_image" in allowed_tools:
         sections.append(
-            "User attachments are full-resolution ComfyUI input references. Inspect the "
-            "exact reference before making visual claims and bind requested attachments in "
-            "the GraphPatch compiler request."
+            "User-attached chat images are already stored at full resolution in ComfyUI's input "
+            'folder. Call `view_chat_image` with the exact attachment reference before describing its '
+            'pixels. Include every requested attachment binding in '
+            '`compile_workflow_refinement_spec`; `apply_workflow_graph_patch` assigns the original '
+            'files atomically. Do not call `place_chat_image_in_node` afterward. Use that lower-level '
+            'tool only for a narrow manual assignment when the semantic compiler reports a classified '
+            'unsupported schema. '
+        )
+    if allowed_tools & PROMPT_VALUE_TOOLS:
+        sections.append(
+            'Prompt text is a value edit, not a topology edit. Use `update_connected_prompt` exactly '
+            'once with a new stable opaque `operation_id`; it prefers the unique connected STRING '
+            'prompt producer, or safely updates the exact serialized prompt widget on its consumer '
+            'when that prompt input is unconnected. Pass `consumer_node_id` when multiple prompt '
+            'consumers exist and `consumer_input` when selecting a non-main role such as '
+            '`system_prompt`; never guess among returned choices. Use `operation=replace` when '
+            'supplying the complete desired prompt. A correction that changes the exclusive subject '
+            'or focus is a rewrite, never another appended clause: if the user supplies a complete '
+            'replacement, send it with `replace`, and do not accumulate it onto the old mixed prompt. '
+            'Translate exclusion wording into a positive description of only the intended subject, '
+            'never repeat or name the negated subject, and express the boundary neutrally as '
+            '“Preserve all unmasked pixels.” For ordinary “add/append,” “prepend,” or “remove” '
+            'requests, use the matching `append`, `prepend`, or `remove_exact` operation so the '
+            'server preserves all untouched text without first exposing the current prompt; '
+            '`remove_exact` must name one unique literal occurrence. When the request bases the '
+            'character or identity on `image2`, `image_2`, or a reference image, call '
+            '`view_prompt_reference_image` once first, inspect its pixels, then set '
+            '`reference_image_used=true` and pass its server-issued `prompt_context_token` unchanged '
+            'into the single `update_connected_prompt` call. This reference binding applies equally '
+            'to a connected prompt producer and an unconnected direct prompt widget on the exact '
+            'reference consumer. When the current prompt text is not explicitly returned, preserve it '
+            'with a bound `append` or `prepend` identity clause rather than inventing a full '
+            'replacement, except for the exclusive-subject rewrite above. Never invent, shorten, '
+            'omit, or reuse the token for another context. A corrective follow-up that does not '
+            'itself cite `image2` or a reference uses only `update_connected_prompt`; a literal retry '
+            'may reuse the immediately prior prompt-reference lane. Never pass an image socket label '
+            'as a node ID or call a workflow compiler/planner for a prompt-only edit. Only when a '
+            'transport disconnect/timeout says the outcome is unknown may you retry once with the '
+            'exact same arguments and `operation_id`; never retry a classified semantic failure, and '
+            'never reuse that ID for changed arguments. '
+        )
+    if allowed_tools & CANVAS_IMAGE_INSPECTION_TOOLS:
+        sections.append(
+            'Images already loaded in canvas nodes are not chat attachments. When the user asks to '
+            'inspect, identify, describe, or compare arbitrary/all canvas images, call '
+            '`view_canvas_images`. Omit `node_ids` for stable canvas-order discovery and continue '
+            'with `next_offset` until `has_more=false`; inspect each returned image block once and '
+            'use its exact source node IDs when reporting. Identical references are deduplicated with '
+            'every source node listed. Never infer pixels from filenames, titles, prompt text, or a '
+            'canvas screenshot, and never ask the user to reattach an image that this tool returned. '
         )
     if allowed_tools & REFINEMENT_MASK_TOOLS:
         sections.append(
-            "For mask changes, inspect the current magenta overlay first, edit in top-left "
-            "pixel or normalized coordinates, then call `confirm_mask_review` with the "
-            "returned token and wait for mandatory user review before queueing."
+            'Mask work has one bounded lane. `view_node_mask` is a prerequisite inspection of the '
+            'exact source image for masking, not proof or an expectation that a mask already exists: '
+            'it reads the source pixels and current alpha/mask state, and an empty mask is valid and '
+            'expected before the first paint. If the correct source is already bound, call '
+            '`view_node_mask` once, inspect the source plus magenta overlay (if any), then call '
+            '`edit_node_mask`. If the same request changes prompt text, use the one-shot prompt-value '
+            'lane above; do not invoke GraphPatch, a planner, or diagnostic tools. For a '
+            'reference-driven prompt-and-mask request, use this exact order: '
+            '`view_prompt_reference_image`, `update_connected_prompt`, `view_node_mask`, '
+            '`edit_node_mask`, `confirm_mask_review`. Give each of the three mutation calls its own '
+            'new stable opaque `operation_id`. The prompt edit changes the graph hash, so mask '
+            'inspection must happen afterward. Stop immediately on a classified failed step and do '
+            'not call remaining lane tools. Only retry an unknown transport outcome with the exact '
+            'same arguments and same `operation_id`; the page will return the attested prior prompt '
+            'result, pending mask/review token, or already-approved receipt without applying or '
+            'queueing twice. If an actual chat attachment must replace the bound source, inspect it '
+            'once and place that original full-resolution reference before inspecting the exact mask '
+            'source. Never guess `image_1`, `image_2`, or another socket label as a node ID/title, '
+            'never inspect or paint a stale source, and never repeat a successful inspection while '
+            'the canvas is unchanged. Prefer normalized top-left coordinates. When using preview '
+            'pixels, convert each coordinate by the returned `originalSize/previewSize` scale before '
+            'editing; the MCP preview may be transport-scaled while the saved source remains '
+            'full-resolution. Set `clear_existing=true` when the supplied regions should be the only '
+            'mask. Immediately call `confirm_mask_review` with the returned token and wait for the '
+            "user's mandatory review; idempotent recovery never bypasses that human gate. If they "
+            'request changes, inspect the latest pending mask, revise it with a new operation ID, and '
+            'open a new review gate. Never queue until the latest mask is approved. Keep preservation '
+            'subjects and unrequested areas outside the mask. '
         )
     return "Ren image rules:\n- " + "\n- ".join(sections) if sections else ""
 
@@ -1957,6 +3703,8 @@ def ren_instructions(
             BRANCH_MUTATION_TOOLS,
             REGISTRY_TOOLS,
             LAYOUT_TOOLS,
+            PROMPT_VALUE_TOOLS,
+            CANVAS_IMAGE_INSPECTION_TOOLS,
         )
         if search_mode != "off":
             allowed_tools.update({"web_search", "web_fetch_page"})
@@ -2008,6 +3756,19 @@ def workflow_context_environment(workflow: dict[str, Any] | None) -> dict[str, s
         "FL_MCP_WORKFLOW_NAME": str((workflow or {}).get("name") or ""),
         "FL_MCP_WORKFLOW_PATH": str((workflow or {}).get("path") or ""),
     }
+
+
+def prompt_reference_environment(
+    mask_lane_state: dict[str, bool] | None,
+    prompt_value_lane_state: dict[str, bool] | None,
+) -> dict[str, str]:
+    """Bind reference-dependent prompt writes outside model-controlled arguments."""
+
+    required = bool(
+        (mask_lane_state or {}).get("promptReferenceImage")
+        or (prompt_value_lane_state or {}).get("referenceImage")
+    )
+    return {"FL_MCP_PROMPT_REFERENCE_REQUIRED": "1" if required else "0"}
 
 
 def web_search_environment(
@@ -2621,8 +4382,14 @@ class ChatRuntime:
                 tool_id = payload.get("toolCallId")
                 for step in reversed(state.tool_steps):
                     if step.get("id") == tool_id:
-                        step["status"] = "done"
-                        step["result"] = payload.get("content")
+                        result = payload.get("content")
+                        if tool_result_needs_choice(result):
+                            step["status"] = "needs_choice"
+                        else:
+                            step["status"] = (
+                                "failed" if tool_result_is_error(result) else "done"
+                            )
+                        step["result"] = result
                         step.setdefault("resultChars", len(str(payload.get("content") or "")))
                         step["modelResultChars"] = len(str(payload.get("content") or ""))
                         step["completedAt"] = utc_now()
@@ -2863,6 +4630,10 @@ class ChatRuntime:
                 str(settings.get("search_mode") or "off"),
             )
             routing_message = turn_context.routing_message
+            mask_lane_state = derive_mask_lane_state(stored_messages, routing_message)
+            prompt_value_lane_state = derive_prompt_value_lane_state(stored_messages, routing_message)
+            state.provider_metadata[MASK_LANE_STATE_KEY] = mask_lane_state
+            state.provider_metadata[PROMPT_VALUE_LANE_STATE_KEY] = prompt_value_lane_state
             allowed_tools = turn_context.allowed_tools
             prompt = (
                 ren_instructions(
@@ -2875,6 +4646,7 @@ class ChatRuntime:
 
             async def prepare_tools(ctx, tool_definitions):
                 del ctx
+                tool_definitions = prepare_provider_tools(tool_definitions, allowed_tools)
                 return model_tool_definitions_for_provider(
                     settings["provider"],
                     remaining_tools_for_run(state, allowed_tools),
@@ -2984,6 +4756,7 @@ class ChatRuntime:
             worker = None
             if allowed_tools:
                 web_environment = web_search_environment(settings, routing_message)
+                reference_environment = prompt_reference_environment(mask_lane_state, prompt_value_lane_state)
                 allowed_tool_names = ",".join(sorted(allowed_tools))
                 ws_url = self._ws_url()
                 workflow_environment = workflow_context_environment(state.workflow)
@@ -2996,6 +4769,7 @@ class ChatRuntime:
                     web_environment["FL_MCP_WEB_SEARCH_MODE"],
                     web_environment["FL_MCP_WEB_IMAGES_ALLOWED"],
                     web_environment["FL_MCP_TAVILY_API_KEY"],
+                    reference_environment["FL_MCP_PROMPT_REFERENCE_REQUIRED"],
                 )
                 environment = os.environ.copy()
                 environment.update({
@@ -3008,6 +4782,7 @@ class ChatRuntime:
                     ).hex[:16],
                     "FL_MCP_ALLOWED_TOOLS": allowed_tool_names,
                     **workflow_environment,
+                    **reference_environment,
                     **web_environment,
                 })
                 worker = await self._get_mcp_worker(
@@ -3111,7 +4886,11 @@ class ChatRuntime:
                 await self.publish(state, {
                     "type": "RUN_ERROR",
                     "message": error_message,
-                    "code": "chat_run_failed",
+                    "code": getattr(exc, "code", None) or (
+                        "provider_tool_surface_mismatch"
+                        if "provider_tool_surface_mismatch:" in str(exc)
+                        else "chat_run_failed"
+                    ),
                 })
         finally:
             state.done = True
@@ -3161,6 +4940,10 @@ class ChatRuntime:
             str(settings.get("search_mode") or "off"),
         )
         routing_message = turn_context.routing_message
+        mask_lane_state = derive_mask_lane_state(messages, routing_message)
+        prompt_value_lane_state = derive_prompt_value_lane_state(messages, routing_message)
+        state.provider_metadata[MASK_LANE_STATE_KEY] = mask_lane_state
+        state.provider_metadata[PROMPT_VALUE_LANE_STATE_KEY] = prompt_value_lane_state
         allowed_tools = turn_context.allowed_tools
         prompt = (
             ren_instructions(
@@ -3188,17 +4971,29 @@ class ChatRuntime:
             model=str(settings["model"]),
             metadata_key="claudeSessionId",
         )
-        if conversation_needs_compaction(messages):
+        tool_surface = canonical_ren_tool_surface(allowed_tools)
+        _, tool_surface_changed = resumable_provider_thread(
+            messages, thread_key="claudeSessionId", tool_surface=tool_surface,
+        )
+        state.provider_metadata[REN_TOOL_SURFACE_KEY] = tool_surface
+        if tool_surface_changed or conversation_needs_compaction(messages):
             claude_session_id = None
         provider_user_message, context_compacted = native_prompt_with_compaction(
             messages,
             turn_context.provider_user_message,
             bootstrap=claude_session_id is None,
+            force=tool_surface_changed,
+            rollover_reason="tool_surface_changed" if tool_surface_changed else "context_limit",
         )
         if context_compacted:
             state.provider_metadata.update({
                 "contextCompacted": True,
                 "providerThreadRolledOver": True,
+                "providerThreadRolloverReason": (
+                    "tool_surface_changed"
+                    if tool_surface_changed
+                    else "context_limit"
+                ),
             })
         elif claude_session_id is None and len(messages) > 1:
             state.provider_metadata["providerContextBootstrapped"] = True
@@ -3210,6 +5005,7 @@ class ChatRuntime:
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-claude-{state.run_id}",
             **workflow_context_environment(state.workflow),
+            **prompt_reference_environment(mask_lane_state, prompt_value_lane_state),
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
             **web_search_environment(settings, routing_message),
             "CLAUDE_AGENT_SDK_CLIENT_APP": "comfyui-fl-mcp/ren",
@@ -3371,7 +5167,7 @@ class ChatRuntime:
             if callable(interrupt):
                 state.cancel_callback = interrupt
             if allowed_tools:
-                await wait_for_claude_mcp(client)
+                await wait_for_claude_mcp(client, expected_tools=allowed_tools)
             session_id = (
                 captured_session_id
                 or state.run_id
@@ -3467,10 +5263,16 @@ class ChatRuntime:
                             isinstance(block, ToolResultBlock)
                             and block.tool_use_id in seen_tool_ids
                         ):
+                            result_content: Any = block.content
+                            if block.is_error is True:
+                                result_content = {
+                                    "isError": True,
+                                    "content": block.content,
+                                }
                             await self.publish(state, {
                                 "type": "TOOL_CALL_RESULT",
                                 "toolCallId": block.tool_use_id,
-                                "content": tool_result_content(block.content),
+                                "content": tool_result_content(result_content),
                             })
                 elif isinstance(message, ResultMessage):
                     result_message = message
@@ -3574,6 +5376,10 @@ class ChatRuntime:
             str(settings.get("search_mode") or "off"),
         )
         routing_message = turn_context.routing_message
+        mask_lane_state = derive_mask_lane_state(messages, routing_message)
+        prompt_value_lane_state = derive_prompt_value_lane_state(messages, routing_message)
+        state.provider_metadata[MASK_LANE_STATE_KEY] = mask_lane_state
+        state.provider_metadata[PROMPT_VALUE_LANE_STATE_KEY] = prompt_value_lane_state
         allowed_tools = turn_context.allowed_tools
         prompt = (
             ren_instructions(
@@ -3598,17 +5404,29 @@ class ChatRuntime:
             model=str(settings["model"]),
             metadata_key="codexThreadId",
         )
-        if conversation_needs_compaction(messages):
+        tool_surface = canonical_ren_tool_surface(allowed_tools)
+        _, tool_surface_changed = resumable_provider_thread(
+            messages, thread_key="codexThreadId", tool_surface=tool_surface,
+        )
+        state.provider_metadata[REN_TOOL_SURFACE_KEY] = tool_surface
+        if tool_surface_changed or conversation_needs_compaction(messages):
             codex_thread_id = None
         provider_user_message, context_compacted = native_prompt_with_compaction(
             messages,
             turn_context.provider_user_message,
             bootstrap=codex_thread_id is None,
+            force=tool_surface_changed,
+            rollover_reason="tool_surface_changed" if tool_surface_changed else "context_limit",
         )
         if context_compacted:
             state.provider_metadata.update({
                 "contextCompacted": True,
                 "providerThreadRolledOver": True,
+                "providerThreadRolloverReason": (
+                    "tool_surface_changed"
+                    if tool_surface_changed
+                    else "context_limit"
+                ),
             })
         elif codex_thread_id is None and len(messages) > 1:
             state.provider_metadata["providerContextBootstrapped"] = True
@@ -3619,6 +5437,7 @@ class ChatRuntime:
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-codex-{state.run_id}",
             **workflow_context_environment(state.workflow),
+            **prompt_reference_environment(mask_lane_state, prompt_value_lane_state),
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
             **web_search_environment(settings, routing_message),
         }
@@ -3863,6 +5682,7 @@ class ChatRuntime:
                 codex._client,
                 status_params,
                 ListMcpServerStatusResponse,
+                expected_tools=allowed_tools,
             )
             unexpected_servers = [
                 item.name

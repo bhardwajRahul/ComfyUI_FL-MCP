@@ -11,6 +11,7 @@ async function loadQueryExecutor(nodes) {
     const source = await readFile(new URL("web/js/query_executor.js", root), "utf8");
     const transformed = source
         .replace('import { app } from "../../scripts/app.js";', "const app = globalThis.app;")
+        .replace(/^import[\s\S]*?;$/gm, "")
         .replace("export class QueryExecutor", "class QueryExecutor");
     const context = vm.createContext({ app: { graph: { _nodes: nodes } }, console });
     vm.runInContext(`${transformed}\nglobalThis.QueryExecutor = QueryExecutor;`, context);

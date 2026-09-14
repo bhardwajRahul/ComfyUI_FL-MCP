@@ -1,11 +1,12 @@
 [project]
 name = "comfyui-fl-mcp"
-version = "0.8.0"
+version = "0.9.0"
 description = "Local MCP server and browser bridge for ComfyUI. Inspect workflows, edit graphs, queue generations, manage models, and connect MCP-compatible agents to your local ComfyUI setup."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
+    "aiohttp",
     "fastapi>=0.115,<0.116",
     "uvicorn[standard]",
     "python-multipart",
@@ -15,6 +16,7 @@ dependencies = [
     "claude-agent-sdk>=0.2.120,<0.3",
     "openai-codex==0.144.4",
     "pydantic-ai-slim[ag-ui,anthropic,mcp,openai]>=1.1,<1.2",
+    "opentelemetry-api==1.37.0",
     "keyring>=25,<26",
     "pydantic",
     "python-dotenv",
@@ -22,6 +24,13 @@ dependencies = [
     "selectolax>=0.4.11,<0.5",
     "Pillow",
     "PyYAML>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
 ]
 
 [project.urls]

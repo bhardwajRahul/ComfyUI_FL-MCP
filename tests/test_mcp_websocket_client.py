@@ -240,3 +240,26 @@ async def test_native_turn_controls_advertise_only_the_compact_apply_handle(monk
     assert tool.parameters["properties"]["request"]["required"] == ["handle"]
     assert len(str(tool.parameters)) < 500
     assert "opaque apply handle" in tool.description
+
+
+async def test_embedded_tool_filter_rejects_a_missing_selected_tool(monkeypatch):
+    class Tool:
+        def __init__(self, name):
+            self.name = name
+
+    class FakeMcp:
+        async def list_tools(self, *, run_middleware):
+            assert run_middleware is False
+            return [Tool("workflow_overview")]
+
+        def remove_tool(self, _name):
+            raise AssertionError("filter must fail before removing tools")
+
+    monkeypatch.setattr(mcp_server, "mcp", FakeMcp())
+    monkeypatch.setenv(
+        "FL_MCP_ALLOWED_TOOLS",
+        "workflow_overview,update_connected_prompt",
+    )
+
+    with pytest.raises(RuntimeError, match="provider_tool_surface_mismatch"):
+        await mcp_server._restrict_tools_from_environment()

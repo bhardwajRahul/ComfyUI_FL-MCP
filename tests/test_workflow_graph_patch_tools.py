@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from copy import deepcopy
@@ -454,7 +455,8 @@ class _FakeCatalogClient:
         self.catalog_hash = catalog_hash or catalog_contract_hash(self.data)
         self.force_refreshes = []
 
-    async def catalog_snapshot(self, *, force_refresh: bool = False):
+    async def catalog_snapshot(self, *, force_refresh: bool = False, max_age_seconds=None):
+        assert max_age_seconds == mcp_server.STRICT_CATALOG_FRESHNESS_SECONDS
         self.force_refreshes.append(force_refresh)
         return NodeCatalogSnapshot(
             data=self.data,
@@ -728,6 +730,159 @@ def test_backend_idempotency_accepts_attested_same_value_and_layout_no_op_retry(
     assert result["already_applied"] is True
     assert result["verification"]["idempotency_verified"] is True
     assert result["queued"] is False
+
+
+def test_backend_idempotency_accepts_only_exact_native_upload_widget_projection():
+    catalog = _catalog()
+    plan = GraphPatchPlan.model_validate(
+        {
+            "operation": "patch",
+            "expected_workflow_identity": "fl-mcp-workflow-before",
+            "expected_graph_hash": "a" * 64,
+            "assertions": {"nodes": [], "edges": []},
+            "create_nodes": [
+                {
+                    "alias": "input_image",
+                    "node_type": "LoadImage",
+                    "schema_hash": node_schema_hash(
+                        "LoadImage",
+                        catalog["LoadImage"],
+                    ),
+                    "values": {"image": "example.png"},
+                }
+            ],
+            "expected_delta": {
+                "created_node_count": 1,
+                "updated_node_count": 0,
+                "removed_node_count": 0,
+                "added_edge_count": 0,
+                "removed_edge_count": 0,
+                "final_node_count": 1,
+                "final_edge_count": 0,
+            },
+        }
+    )
+    catalog_hash = catalog_contract_hash(catalog)
+    request = ApplyGraphPatchRequest(
+        application_id="graph-patch-load-image-retry-0001",
+        expected_catalog_hash=catalog_hash,
+        patch_hash=graph_patch_hash(plan, catalog_hash),
+        plan=plan,
+    )
+    active = {
+        "workflow_identity": plan.expected_workflow_identity,
+        "graph_hash": "e" * 64,
+        "graph_patch_content_hash": CONTENT_HASH,
+        "workflow": {
+            "version": 0.4,
+            "last_node_id": 9,
+            "last_link_id": 0,
+            "nodes": [
+                {
+                    "id": 9,
+                    "type": "LoadImage",
+                    "inputs": [
+                        {
+                            "name": "image",
+                            "type": "COMBO",
+                            "widget": {"name": "image"},
+                            "link": None,
+                        },
+                        {
+                            "name": "upload",
+                            "type": "IMAGEUPLOAD",
+                            "widget": {"name": "upload"},
+                            "link": None,
+                        },
+                    ],
+                    "outputs": [
+                        {"name": "IMAGE", "type": "IMAGE", "links": None},
+                        {"name": "MASK", "type": "MASK", "links": None},
+                    ],
+                    "widgets_values": ["example.png", "image"],
+                }
+            ],
+            "links": [],
+            "groups": [],
+            "config": {},
+            "extra": {
+                "fl_mcp_graph_patch_ledger": {
+                    "schema": "fl-mcp.workflow-graph-patch.v2",
+                    "order": [request.application_id],
+                    "entries": {
+                        request.application_id: {
+                            "patch_hash": request.patch_hash,
+                            "result_content_hash": CONTENT_HASH,
+                            "aliases": {"input_image": 9},
+                            "created_node_ids": [9],
+                            "removed_node_ids": [],
+                        }
+                    },
+                }
+            },
+        },
+    }
+
+    result = mcp_server._completed_graph_patch_result(
+        active,
+        request,
+        catalog=catalog,
+    )
+
+    assert result["success"] is True
+    assert result["already_applied"] is True
+    assert result["verification"]["idempotency_verified"] is True
+
+    ambiguous = deepcopy(active)
+    ambiguous["workflow"]["nodes"][0]["inputs"][1]["widget"]["name"] = "image"
+    ambiguous_result = mcp_server._completed_graph_patch_result(
+        ambiguous,
+        request,
+        catalog=catalog,
+    )
+    assert ambiguous_result["success"] is False
+    assert ambiguous_result["error"]["code"] == "invalid_graph_patch_ledger"
+    assert "completed_patch_values_unavailable" in {
+        issue["code"]
+        for issue in ambiguous_result["validation"]["issues"]
+    }
+
+    invalid_projections = {}
+    wrong_type = deepcopy(active)
+    wrong_type["workflow"]["nodes"][0]["inputs"][1]["type"] = "STRING"
+    invalid_projections["wrong upload type"] = wrong_type
+
+    wrong_name = deepcopy(active)
+    wrong_name["workflow"]["nodes"][0]["inputs"][1]["name"] = "refresh"
+    wrong_name["workflow"]["nodes"][0]["inputs"][1]["widget"]["name"] = "refresh"
+    invalid_projections["wrong upload name"] = wrong_name
+
+    wrong_target = deepcopy(active)
+    wrong_target["workflow"]["nodes"][0]["widgets_values"][1] = "mask"
+    invalid_projections["wrong paired widget"] = wrong_target
+
+    second_extra = deepcopy(active)
+    second_extra["workflow"]["nodes"][0]["inputs"].append({
+        "name": "refresh",
+        "type": "IMAGEUPLOAD",
+        "widget": {"name": "refresh"},
+        "link": None,
+    })
+    second_extra["workflow"]["nodes"][0]["widgets_values"].append("image")
+    invalid_projections["second extra widget"] = second_extra
+
+    for label, invalid in invalid_projections.items():
+        invalid_result = mcp_server._completed_graph_patch_result(
+            invalid,
+            request,
+            catalog=catalog,
+        )
+        assert invalid_result["success"] is False, label
+        assert invalid_result["error"]["code"] == "invalid_graph_patch_ledger", label
+        assert "completed_patch_values_unavailable" in {
+            issue["code"]
+            for issue in invalid_result["validation"]["issues"]
+        }, label
 
 
 def test_backend_idempotency_does_not_cross_workflow_identity():
@@ -1801,6 +1956,45 @@ async def test_compile_and_apply_tools_round_trip_one_unchanged_empty_canvas_pat
 
 
 @pytest.mark.asyncio
+async def test_apply_tool_reports_outcome_unknown_on_frontend_timeout(monkeypatch):
+    # A bare asyncio.TimeoutError from the websocket bridge used to surface as
+    # "Tool execution failed: " (an empty message, since TimeoutError() has no
+    # str()) - telling the model nothing about whether the canvas changed or
+    # that retrying with the same request is safe.
+    async def execute_tool(ctx, name, payload, timeout_ms=30000):
+        if name == "workflow_get_current_json":
+            return _active_workflow_result()
+        assert name == "apply_workflow_graph_patch"
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_node_library_client",
+        lambda **kwargs: _FakeCatalogClient(),
+    )
+    monkeypatch.setattr(mcp_server.settings, "enable_workflow_writes", True)
+
+    planned = await mcp_server.compile_workflow_refinement_spec.fn(
+        _semantic_request(),
+        _context(),
+    )
+    assert planned["valid"] is True, planned["issues"]
+    request = ApplyGraphPatchRequest.model_validate(deepcopy(planned["apply_request"]))
+
+    result = await mcp_server.apply_workflow_graph_patch.fn(request, _context())
+
+    assert result["success"] is False
+    assert result["applied"] is False
+    assert result["already_applied"] is False
+    assert result["application_id"] == request.application_id
+    assert result["patch_hash"] == request.patch_hash
+    assert result["error"]["code"] == "apply_outcome_unknown"
+    assert result["rollback"]["complete"] is False
+    assert result["queued"] is False
+
+
+@pytest.mark.asyncio
 async def test_inferred_float_default_survives_integral_json_apply_round_trip(
     monkeypatch,
 ):
@@ -2139,14 +2333,17 @@ async def test_apply_rechecks_attachment_after_awaited_catalog_refresh(
             super().__init__()
             self.snapshot_count = 0
 
-        async def catalog_snapshot(self, *, force_refresh: bool = False):
+        async def catalog_snapshot(self, *, force_refresh: bool = False, max_age_seconds=None):
             self.snapshot_count += 1
             if self.snapshot_count == 2:
                 if change == "deleted":
                     attachment_path.unlink()
                 else:
                     attachment_path.write_bytes(b"X" * len(original))
-            return await super().catalog_snapshot(force_refresh=force_refresh)
+            return await super().catalog_snapshot(
+                force_refresh=force_refresh,
+                max_age_seconds=max_age_seconds,
+            )
 
     catalog_client = MutatingCatalogClient()
     monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
@@ -2174,7 +2371,7 @@ async def test_apply_rechecks_attachment_after_awaited_catalog_refresh(
     )
 
     assert catalog_client.snapshot_count == 2
-    assert catalog_client.force_refreshes == [False, True]
+    assert catalog_client.force_refreshes == [False, False]
     assert result["success"] is False
     assert result["applied"] is False
     assert result["error"]["code"] == "attachment_missing_or_changed"

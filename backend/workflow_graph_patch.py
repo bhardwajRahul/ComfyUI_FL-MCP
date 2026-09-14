@@ -51,6 +51,7 @@ from workflow_schema_capabilities import (
     infer_dynamic_selector_values,
     materialize_inputs,
     normalize_node_schema,
+    stable_default_for_spec,
 )
 from workflow_scope import (
     SCOPE_INPUT_NODE_ID,
@@ -1281,6 +1282,17 @@ def _canonical_values(
             if metadata.get("dynamic_type") == "COMFY_DYNAMICCOMBO_V3" and name in values:
                 continue
             if name not in values:
+                # ComfyUI's own frontend never leaves a widget truly empty -
+                # a combo with no explicit selection auto-selects its first
+                # option (e.g. LoadImage's file picker defaults to the first
+                # file in the input folder). Match that instead of blocking
+                # node creation outright; only a widget with no deterministic
+                # fallback at all (e.g. a combo with zero options) still
+                # requires an explicit value.
+                default = stable_default_for_spec(slot["spec"])
+                if default.available:
+                    accepted[name] = _canonical_widget_value(slot["spec"], default.value)
+                    continue
                 issues.append(
                     _issue(
                         "missing_widget_value",
@@ -3510,12 +3522,73 @@ def verify_completed_graph_patch_state(
         except (TypeError, ValueError) as exc:
             issues.append(_issue("completed_patch_values_unavailable", path, f"Current widget values could not be materialized: {exc}"))
             return None
-        if len(active_widgets) != len(widgets):
+        if len(active_widgets) == len(widgets):
+            return {
+                capability.path: value
+                for capability, value in zip(active_widgets, widgets, strict=True)
+            }
+
+        raw_inputs = raw_node.get("inputs")
+        serialized_widget_inputs: list[dict[str, Any]] = []
+        named_widgets_are_exact = isinstance(raw_inputs, list)
+        if isinstance(raw_inputs, list):
+            for raw_input in raw_inputs:
+                if not isinstance(raw_input, Mapping):
+                    named_widgets_are_exact = False
+                    break
+                widget = raw_input.get("widget")
+                if not isinstance(widget, Mapping):
+                    continue
+                widget_name = widget.get("name")
+                if (
+                    not isinstance(widget_name, str)
+                    or not widget_name
+                    or raw_input.get("name") != widget_name
+                ):
+                    named_widgets_are_exact = False
+                    break
+                serialized_widget_inputs.append(
+                    {
+                        "name": widget_name,
+                        "type": raw_input.get("type"),
+                        "link": raw_input.get("link"),
+                    }
+                )
+
+        active_paths = [capability.path for capability in active_widgets]
+        schema_widget_paths = {
+            capability.path
+            for capability in capabilities.inputs
+            if capability.widget
+        }
+        serialized_names = [item["name"] for item in serialized_widget_inputs]
+        upload_capabilities = [
+            capability
+            for capability in active_widgets
+            if _is_image_upload_widget(capability)
+        ]
+        exact_upload_projection = bool(
+            named_widgets_are_exact
+            and len(set(active_paths)) == len(active_paths)
+            and len(serialized_widget_inputs) == len(widgets) == len(active_widgets) + 1
+            and len(set(serialized_names)) == len(serialized_names)
+            and serialized_names == [*active_paths, "upload"]
+            and len(upload_capabilities) == 1
+            and "upload" not in schema_widget_paths
+            and serialized_widget_inputs[-1]
+            == {"name": "upload", "type": "IMAGEUPLOAD", "link": None}
+            and serialized_widget_inputs[active_paths.index(upload_capabilities[0].path)]["type"]
+            == "COMBO"
+            and serialized_widget_inputs[active_paths.index(upload_capabilities[0].path)]["link"]
+            is None
+            and widgets[-1] == upload_capabilities[0].path
+        )
+        if not exact_upload_projection:
             issues.append(_issue("completed_patch_values_unavailable", path, "The current positional widgets do not map to one exact active schema branch."))
             return None
         return {
             capability.path: value
-            for capability, value in zip(active_widgets, widgets, strict=True)
+            for capability, value in zip(active_widgets, widgets[:-1], strict=True)
         }
 
     def attest_values(
